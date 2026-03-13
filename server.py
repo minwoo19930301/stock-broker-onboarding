@@ -28,14 +28,16 @@ from backend.app.catalog import (
 ROOT = Path(__file__).resolve().parent
 COOKIE_NAME = "stock_broker_wizard_v2"
 BUILD_DATE = "2026-03-13"
+PROJECT_TITLE = "AUTO STOCK TRADER(KR)"
+PROJECT_SLUG = "auto-stock-trader-kr"
 READY_BROKERS = [broker for broker in BROKER_DETAILS if broker["status"] == "ready"]
 MODAL_KEYS = {"broker", "symbol", "pattern", "ai"}
 
 AUTH_PROVIDERS = [
-    {"value": "google", "label": "Google", "subtitle": "Google 계정으로 시작", "className": "auth-google", "email": "gmail.com"},
-    {"value": "kakao", "label": "Kakao", "subtitle": "카카오로 빠르게 시작", "className": "auth-kakao", "email": "kakao.com"},
-    {"value": "naver", "label": "Naver", "subtitle": "네이버 계정으로 연결", "className": "auth-naver", "email": "naver.com"},
-    {"value": "facebook", "label": "Facebook", "subtitle": "Facebook 계정으로 계속", "className": "auth-facebook", "email": "facebook.com"},
+    {"value": "google", "label": "Google", "subtitle": "Google 계정으로 시작", "className": "auth-google", "email": "gmail.com", "icon": "G"},
+    {"value": "kakao", "label": "Kakao", "subtitle": "카카오로 빠르게 시작", "className": "auth-kakao", "email": "kakao.com", "icon": "K"},
+    {"value": "naver", "label": "Naver", "subtitle": "네이버 계정으로 연결", "className": "auth-naver", "email": "naver.com", "icon": "N"},
+    {"value": "facebook", "label": "Facebook", "subtitle": "Facebook 계정으로 계속", "className": "auth-facebook", "email": "facebook.com", "icon": "f"},
 ]
 
 PATTERN_OPTIONS = [
@@ -86,6 +88,9 @@ AI_PROVIDERS = [
 FLASH_MESSAGES = {
     "logged_in": {"kind": "success", "text": "로그인 세션을 시작했습니다."},
     "logged_out": {"kind": "success", "text": "로그아웃했습니다."},
+    "signed_up": {"kind": "success", "text": "회원가입이 완료되어 대시보드로 이동했습니다."},
+    "find_id_requested": {"kind": "success", "text": "입력한 연락처 기준으로 아이디 안내 절차를 시작했습니다."},
+    "find_password_requested": {"kind": "success", "text": "비밀번호 재설정 절차를 시작했습니다."},
     "reset": {"kind": "success", "text": "워크스페이스를 초기화했습니다."},
     "broker_added": {"kind": "success", "text": "증권 계좌를 추가했습니다."},
     "broker_removed": {"kind": "success", "text": "증권 연결을 삭제했습니다."},
@@ -219,13 +224,36 @@ def is_authenticated(draft: dict) -> bool:
 
 
 def provider_meta(provider: str | None) -> dict:
+    if provider == "password":
+        return {
+            "value": "password",
+            "label": "ID/PW",
+            "subtitle": "아이디와 비밀번호 로그인",
+            "className": "auth-password",
+            "email": "autostock.kr",
+            "icon": "@",
+        }
     return next((item for item in AUTH_PROVIDERS if item["value"] == provider), AUTH_PROVIDERS[0])
 
 
 def provider_label(provider: str | None) -> str:
     if not provider:
         return "미연결"
-    return provider_meta(provider)["label"] if provider in {item["value"] for item in AUTH_PROVIDERS} else provider
+    return provider_meta(provider)["label"]
+
+
+def nickname_from_identity(user_id: str) -> str:
+    base = trim(user_id, 80)
+    if not base:
+        return "사용자"
+    return (base.split("@", 1)[0] or base)[:24]
+
+
+def email_from_identity(user_id: str) -> str:
+    identity = trim(user_id, 120)
+    if "@" in identity:
+        return identity
+    return f"{identity}@autostock.kr"
 
 
 def flash_message_from_query(query: dict[str, list[str]]) -> dict | None:
@@ -470,70 +498,171 @@ def render_message(message: dict | None) -> str:
     return f'<div class="message message-{html(message["kind"])}">{html(message["text"])}</div>'
 
 
-def render_login_page(message: dict | None = None) -> bytes:
-    provider_buttons = []
+def render_auth_links(current: str) -> str:
+    links = [
+        ("/signup", "회원가입", current == "signup"),
+        ("/find-id", "아이디 찾기", current == "find-id"),
+        ("/find-password", "비밀번호 찾기", current == "find-password"),
+        ("/login", "로그인", current == "login"),
+    ]
+    rendered = []
+    for href, label, selected in links:
+        class_name = "auth-footer-link auth-footer-link-active" if selected else "auth-footer-link"
+        rendered.append(f'<a class="{class_name}" href="{href}">{html(label)}</a>')
+    return "".join(rendered)
+
+
+def render_social_icons() -> str:
+    buttons = []
     for provider in AUTH_PROVIDERS:
-        provider_buttons.append(
+        buttons.append(
             f"""
             <form method="post" action="/auth/demo">
               <input type="hidden" name="provider" value="{html(provider['value'])}" />
-              <button class="auth-button {html(provider['className'])}" type="submit">
-                <span class="auth-logo">{html(provider['label'][0])}</span>
-                <span>
-                  <strong>{html(provider['label'])}</strong>
-                  <small>{html(provider['subtitle'])}</small>
-                </span>
+              <button class="sso-icon-button {html(provider['className'])}" type="submit" aria-label="{html(provider['label'])}">
+                <span>{html(provider['icon'])}</span>
               </button>
             </form>
             """
         )
+    return "".join(buttons)
+
+
+def render_login_form(values: dict[str, str] | None) -> str:
+    current = values or {}
+    return f"""
+    <form class="auth-form" method="post" action="/auth/login">
+      <div class="auth-field">
+        <label for="userId">아이디</label>
+        <input id="userId" name="userId" type="text" autocomplete="username" placeholder="아이디 또는 이메일" value="{html(current.get('userId', ''))}" />
+      </div>
+      <div class="auth-field">
+        <label for="password">비밀번호</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" placeholder="비밀번호" />
+      </div>
+      <button class="button button-primary auth-submit" type="submit">로그인</button>
+    </form>
+    """
+
+
+def render_signup_form(values: dict[str, str] | None) -> str:
+    current = values or {}
+    return f"""
+    <form class="auth-form" method="post" action="/auth/signup">
+      <div class="auth-field">
+        <label for="nickname">이름</label>
+        <input id="nickname" name="nickname" type="text" autocomplete="name" placeholder="이름" value="{html(current.get('nickname', ''))}" />
+      </div>
+      <div class="auth-field">
+        <label for="signupEmail">이메일</label>
+        <input id="signupEmail" name="email" type="email" autocomplete="email" placeholder="you@example.com" value="{html(current.get('email', ''))}" />
+      </div>
+      <div class="auth-field auth-field-split">
+        <div>
+          <label for="signupPassword">비밀번호</label>
+          <input id="signupPassword" name="password" type="password" autocomplete="new-password" placeholder="8자 이상" />
+        </div>
+        <div>
+          <label for="signupPasswordConfirm">비밀번호 확인</label>
+          <input id="signupPasswordConfirm" name="passwordConfirm" type="password" autocomplete="new-password" placeholder="한 번 더 입력" />
+        </div>
+      </div>
+      <button class="button button-primary auth-submit" type="submit">회원가입</button>
+    </form>
+    """
+
+
+def render_recovery_form(mode: str, values: dict[str, str] | None) -> str:
+    current = values or {}
+    if mode == "find-id":
+        return f"""
+        <form class="auth-form" method="post" action="/auth/find-id">
+          <div class="auth-field">
+            <label for="recoverName">이름</label>
+            <input id="recoverName" name="name" type="text" autocomplete="name" placeholder="회원가입 이름" value="{html(current.get('name', ''))}" />
+          </div>
+          <div class="auth-field">
+            <label for="recoverPhone">휴대폰 번호</label>
+            <input id="recoverPhone" name="phone" type="tel" autocomplete="tel" placeholder="01012345678" value="{html(current.get('phone', ''))}" />
+          </div>
+          <button class="button button-primary auth-submit" type="submit">아이디 찾기</button>
+        </form>
+        """
+
+    return f"""
+    <form class="auth-form" method="post" action="/auth/find-password">
+      <div class="auth-field">
+        <label for="recoverPasswordId">아이디</label>
+        <input id="recoverPasswordId" name="userId" type="text" autocomplete="username" placeholder="아이디 또는 이메일" value="{html(current.get('userId', ''))}" />
+      </div>
+      <div class="auth-field">
+        <label for="recoverPasswordEmail">이메일</label>
+        <input id="recoverPasswordEmail" name="email" type="email" autocomplete="email" placeholder="가입 이메일" value="{html(current.get('email', ''))}" />
+      </div>
+      <button class="button button-primary auth-submit" type="submit">비밀번호 재설정</button>
+    </form>
+    """
+
+
+def render_auth_page(mode: str, message: dict | None = None, values: dict[str, str] | None = None) -> bytes:
+    page_meta = {
+        "login": {
+            "title": "로그인",
+            "subtitle": "아이디와 비밀번호로 로그인하거나 간편 로그인으로 바로 시작하세요.",
+            "form": render_login_form(values),
+        },
+        "signup": {
+            "title": "회원가입",
+            "subtitle": "새 계정을 만들고 바로 대시보드에서 증권과 전략을 설정하세요.",
+            "form": render_signup_form(values),
+        },
+        "find-id": {
+            "title": "아이디 찾기",
+            "subtitle": "가입한 이름과 연락처로 아이디 안내를 요청합니다.",
+            "form": render_recovery_form("find-id", values),
+        },
+        "find-password": {
+            "title": "비밀번호 찾기",
+            "subtitle": "아이디와 이메일을 확인한 뒤 재설정 절차를 시작합니다.",
+            "form": render_recovery_form("find-password", values),
+        },
+    }
+    current = page_meta[mode]
+    helper = ""
+    if mode == "login":
+        helper = """
+        <div class="auth-divider"><span>간편 로그인</span></div>
+        <div class="sso-row">
+          {social_icons}
+        </div>
+        <p class="auth-helper">SSO는 현재 데모 세션으로 연결됩니다.</p>
+        """.replace("{social_icons}", render_social_icons())
 
     html_body = f"""<!doctype html>
 <html lang="ko">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>로그인 | 주식 자동매매</title>
+    <title>{html(current['title'])} | {html(PROJECT_TITLE)}</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body class="login-body">
-    <main class="login-shell">
-      <section class="login-stage">
-        <div class="login-copy">
-          <span class="eyebrow">Auto Trading</span>
-          <h1>로그인 후 바로 대시보드에서 시작하는 자동매매 워크스페이스</h1>
-          <p>먼저 로그인하고, 이후 빈 대시보드에서 증권 계좌를 연결한 뒤 종목과 전략을 하나씩 쌓아갑니다.</p>
-          <div class="login-bullets">
-            <div class="bullet-card">
-              <strong>증권 먼저 연결</strong>
-              <span>빈 대시보드에서 모달로 바로 추가</span>
-            </div>
-            <div class="bullet-card">
-              <strong>정밀 전략은 템플릿</strong>
-              <span>정액, 정률, 시간 조건은 패턴 빌더로 설정</span>
-            </div>
-            <div class="bullet-card">
-              <strong>애매한 조건은 AI</strong>
-              <span>정량화하기 어려운 문장은 AI 전략으로 분리</span>
-            </div>
-          </div>
+    <main class="auth-shell">
+      <section class="auth-card">
+        <div class="auth-brand">
+          <span class="brand-mark">AST</span>
+          <strong>{html(PROJECT_TITLE)}</strong>
         </div>
-
-        <div class="login-card">
-          <div class="card-head">
-            <span class="eyebrow eyebrow-muted">SSO Login</span>
-            <h2>소셜 로그인</h2>
-            <p>Google, Kakao, Naver, Facebook 기반 흐름으로 시작합니다.</p>
-          </div>
-          {render_message(message)}
-          <div class="auth-stack">
-            {''.join(provider_buttons)}
-          </div>
-          <div class="login-note">
-            <strong>현재 프로토타입</strong>
-            <p>실제 OAuth 앱 키를 붙이기 전까지는 SSO 버튼이 데모 세션으로 동작합니다.</p>
-          </div>
+        <div class="auth-heading">
+          <h1>{html(current['title'])}</h1>
+          <p>{html(current['subtitle'])}</p>
         </div>
+        {render_message(message)}
+        {current['form']}
+        {helper}
+        <nav class="auth-footer-links" aria-label="계정 메뉴">
+          {render_auth_links(mode)}
+        </nav>
       </section>
     </main>
   </body>
@@ -547,8 +676,8 @@ def render_topbar(draft: dict) -> str:
     return f"""
     <header class="dashboard-topbar">
       <div>
-        <span class="eyebrow">Trading Desk</span>
-        <h1>주식 자동매매</h1>
+        <span class="eyebrow">Workspace</span>
+        <h1>{html(PROJECT_TITLE)}</h1>
       </div>
       <div class="topbar-actions">
         <span class="user-badge">{html(provider['label'])} · {html(draft['profile'].get('nickname') or '사용자')}</span>
@@ -1089,7 +1218,7 @@ def render_dashboard_page(
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>대시보드 | 주식 자동매매</title>
+    <title>대시보드 | {html(PROJECT_TITLE)}</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body class="dashboard-body">
@@ -1163,7 +1292,7 @@ def render_dashboard_page(
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "StockBrokerOnboardingPython/0.4"
+    server_version = "AutoStockTraderKR/0.5"
 
     def _send_bytes(
         self,
@@ -1246,11 +1375,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.end_headers()
             return
 
-        if path in {"/login", "/signup"}:
+        if path in {"/login", "/signup", "/find-id", "/find-password"}:
             if is_authenticated(draft):
                 self._send_redirect("/dashboard")
                 return
-            self._send_html(render_login_page(flash), include_body=include_body)
+            mode = {
+                "/login": "login",
+                "/signup": "signup",
+                "/find-id": "find-id",
+                "/find-password": "find-password",
+            }[path]
+            self._send_html(render_auth_page(mode, flash), include_body=include_body)
             return
 
         if path == "/dashboard":
@@ -1279,7 +1414,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             payload = {
                 "status": "ok",
-                "service": "stock-broker-onboarding-python",
+                "service": f"{PROJECT_SLUG}-python",
                 "brokers": len(BROKER_DETAILS),
                 "build": BUILD_DATE,
             }
@@ -1348,6 +1483,95 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         form = self._read_form()
+
+        if path == "/auth/login":
+            user_id = trim(form.get("userId"), 120)
+            password = trim(form.get("password"), 120)
+            if not user_id or not password:
+                self._send_html(
+                    render_auth_page(
+                        "login",
+                        {"kind": "warning", "text": "아이디와 비밀번호를 모두 입력해 주세요."},
+                        form,
+                    )
+                )
+                return
+
+            draft = fresh_draft()
+            draft["profile"] = {
+                "nickname": nickname_from_identity(user_id),
+                "email": email_from_identity(user_id),
+                "phone": "",
+                "auth_provider": "password",
+                "logged_in_at": now_iso(),
+            }
+            self._send_redirect("/dashboard?flash=logged_in", extra_headers={"Set-Cookie": draft_cookie_header(draft)})
+            return
+
+        if path == "/auth/signup":
+            nickname = trim(form.get("nickname"), 80)
+            email = trim(form.get("email"), 120)
+            password = trim(form.get("password"), 120)
+            password_confirm = trim(form.get("passwordConfirm"), 120)
+            if not nickname or not email or not password or not password_confirm:
+                self._send_html(
+                    render_auth_page(
+                        "signup",
+                        {"kind": "warning", "text": "이름, 이메일, 비밀번호를 모두 입력해 주세요."},
+                        form,
+                    )
+                )
+                return
+            if password != password_confirm:
+                self._send_html(
+                    render_auth_page(
+                        "signup",
+                        {"kind": "warning", "text": "비밀번호와 비밀번호 확인이 일치하지 않습니다."},
+                        form,
+                    )
+                )
+                return
+
+            draft = fresh_draft()
+            draft["profile"] = {
+                "nickname": nickname,
+                "email": email,
+                "phone": "",
+                "auth_provider": "password",
+                "logged_in_at": now_iso(),
+            }
+            self._send_redirect("/dashboard?flash=signed_up", extra_headers={"Set-Cookie": draft_cookie_header(draft)})
+            return
+
+        if path == "/auth/find-id":
+            name = trim(form.get("name"), 80)
+            phone = trim(form.get("phone"), 40)
+            if not name or not phone:
+                self._send_html(
+                    render_auth_page(
+                        "find-id",
+                        {"kind": "warning", "text": "이름과 휴대폰 번호를 입력해 주세요."},
+                        form,
+                    )
+                )
+                return
+            self._send_redirect("/find-id?flash=find_id_requested")
+            return
+
+        if path == "/auth/find-password":
+            user_id = trim(form.get("userId"), 120)
+            email = trim(form.get("email"), 120)
+            if not user_id or not email:
+                self._send_html(
+                    render_auth_page(
+                        "find-password",
+                        {"kind": "warning", "text": "아이디와 이메일을 입력해 주세요."},
+                        form,
+                    )
+                )
+                return
+            self._send_redirect("/find-password?flash=find_password_requested")
+            return
 
         if path == "/auth/demo":
             provider = trim(form.get("provider"), 32)

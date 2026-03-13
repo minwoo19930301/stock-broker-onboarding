@@ -1,6 +1,6 @@
-# Stock Broker Onboarding Hub
+# AUTO STOCK TRADER(KR)
 
-국내 증권사 자동매매 서비스를 위한 Python 중심 첫 화면 프로토타입입니다.
+국내 증권사 자동매매 서비스를 위한 Python 중심 프로토타입입니다.
 
 핵심 목표:
 
