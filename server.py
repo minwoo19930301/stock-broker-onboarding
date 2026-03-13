@@ -46,7 +46,7 @@ def load_env_file(env_path: Path) -> None:
 load_env_file(ROOT / ".env")
 
 COOKIE_NAME = "stock_broker_wizard_v2"
-BUILD_DATE = "2026-03-13"
+BUILD_DATE = "2026-03-14"
 PROJECT_TITLE = "AUTO STOCK TRADER(KR)"
 PROJECT_SLUG = "auto-stock-trader-kr"
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip()
