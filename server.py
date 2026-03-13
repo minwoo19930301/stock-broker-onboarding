@@ -1,488 +1,1002 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
 import os
-import re
+from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 from backend.app.catalog import (
     BROKER_CATALOG,
     BROKER_DETAILS,
     CAPABILITY_META,
-    FILTERS,
     STATUS_META,
-    build_summary_counts,
     get_broker_or_none,
-    get_selected_broker,
-    get_visible_brokers,
-    normalize_filter,
     validate_broker_values,
 )
 
 
 ROOT = Path(__file__).resolve().parent
-CAPABILITY_CARDS = [
-    ("quote", "주식 확인"),
-    ("buy", "주식 사기"),
-    ("sell", "주식 팔기"),
-    ("balance", "계좌 잔고 확인"),
-]
-CONNECTION_ROUTE = re.compile(r"^/connections/(?P<broker_id>[^/]+)/(?P<action>validate|export)$")
-BROKER_API_ROUTE = re.compile(r"^/api/v1/brokers/(?P<broker_id>[^/]+)$")
+COOKIE_NAME = "stock_broker_wizard_v1"
 BUILD_DATE = "2026-03-13"
+READY_BROKERS = [broker for broker in BROKER_DETAILS if broker["status"] == "ready"]
+PATTERN_OPTIONS = [
+    {"value": "dip-buy", "label": "N% 하락 시 분할매수"},
+    {"value": "breakout", "label": "전고점 돌파 매수"},
+    {"value": "golden-cross", "label": "이동평균 골든크로스"},
+    {"value": "rsi", "label": "RSI 과매도/과매수"},
+    {"value": "scheduled", "label": "정해진 시간 정액 매매"},
+    {"value": "ai-assisted", "label": "AI 판단 보조"},
+]
+SCHEDULE_OPTIONS = [
+    {"value": "market-open", "label": "장 시작 직후"},
+    {"value": "every-15m", "label": "15분마다"},
+    {"value": "every-30m", "label": "30분마다"},
+    {"value": "every-1h", "label": "1시간마다"},
+    {"value": "daily", "label": "하루 1회"},
+    {"value": "weekly", "label": "주 1회"},
+]
+AI_PROVIDERS = [
+    {"value": "openai", "label": "OpenAI"},
+    {"value": "anthropic", "label": "Anthropic"},
+    {"value": "google", "label": "Google"},
+    {"value": "openrouter", "label": "OpenRouter"},
+    {"value": "custom", "label": "직접 입력"},
+]
+STEP_CONFIG = [
+    {"number": 1, "label": "회원가입", "key": "profile"},
+    {"number": 2, "label": "주가 목록", "key": "overview"},
+    {"number": 3, "label": "증권 추가", "key": "brokers"},
+    {"number": 4, "label": "종목 추가", "key": "symbols"},
+    {"number": 5, "label": "패턴 설정", "key": "patterns"},
+    {"number": 6, "label": "AI API", "key": "ai"},
+]
+
+
+def fresh_draft() -> dict:
+    return {
+        "profile": {"nickname": "", "email": "", "phone": ""},
+        "brokers": [],
+        "symbols": [],
+        "patterns": [],
+        "ai": {"provider": "", "model": "", "prompt": "", "has_api_key": False},
+    }
 
 
 def html(value: object) -> str:
     return escape(str(value), quote=True)
 
 
-def selected_value(value: str | None, option_value: str) -> str:
-    return " selected" if value == option_value else ""
+def trim(value: str | None, limit: int) -> str:
+    return (value or "").strip()[:limit]
 
 
-def active_class(enabled: bool, class_name: str) -> str:
-    return f" {class_name}" if enabled else ""
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def build_url(**params: str) -> str:
-    cleaned = {key: value for key, value in params.items() if value}
-    if not cleaned:
-        return "/"
-    return f"/?{urlencode(cleaned)}"
+def encode_cookie_value(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def normalize_form_values(broker: dict, values: dict[str, str]) -> dict[str, str]:
-    accepted = {field["key"] for field in broker.get("fields", [])}
-    return {field["key"]: values.get(field["key"], "") for field in broker.get("fields", []) if field["key"] in accepted}
+def decode_cookie_value(encoded: str) -> dict:
+    padding = "=" * (-len(encoded) % 4)
+    raw = base64.urlsafe_b64decode((encoded + padding).encode("ascii"))
+    return json.loads(raw.decode("utf-8"))
 
 
-def render_summary_cards() -> str:
-    counts = build_summary_counts()
+def load_draft(cookie_header: str | None) -> dict:
+    draft = fresh_draft()
+    if not cookie_header:
+        return draft
+
+    jar = SimpleCookie()
+    try:
+        jar.load(cookie_header)
+    except Exception:
+        return draft
+
+    morsel = jar.get(COOKIE_NAME)
+    if not morsel:
+        return draft
+
+    try:
+        stored = decode_cookie_value(morsel.value)
+    except Exception:
+        return draft
+
+    if not isinstance(stored, dict):
+        return draft
+
+    merged = deepcopy(draft)
+    merged["profile"].update(stored.get("profile", {}))
+    merged["brokers"] = list(stored.get("brokers", []))[:4]
+    merged["symbols"] = list(stored.get("symbols", []))[:12]
+    merged["patterns"] = list(stored.get("patterns", []))[:12]
+    merged["ai"].update(stored.get("ai", {}))
+    return merged
+
+
+def draft_cookie_header(draft: dict) -> str:
+    return f"{COOKIE_NAME}={encode_cookie_value(draft)}; Path=/; Max-Age=1209600; SameSite=Lax"
+
+
+def clear_cookie_header() -> str:
+    return f"{COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax"
+
+
+def checked_attr(enabled: bool) -> str:
+    return " checked" if enabled else ""
+
+
+def selected_attr(current: str | None, expected: str) -> str:
+    return " selected" if current == expected else ""
+
+
+def find_connected_broker(draft: dict, broker_id: str) -> dict | None:
+    for item in draft["brokers"]:
+        if item["broker_id"] == broker_id:
+            return item
+    return None
+
+
+def find_symbol(draft: dict, symbol_id: str) -> dict | None:
+    for item in draft["symbols"]:
+        if item["id"] == symbol_id:
+            return item
+    return None
+
+
+def compute_step_state(draft: dict) -> dict[str, bool]:
+    profile = draft["profile"]
+    ai = draft["ai"]
+    return {
+        "profile": bool(profile.get("nickname") and profile.get("email")),
+        "overview": bool(draft["brokers"] or draft["symbols"] or draft["patterns"] or ai.get("provider")),
+        "brokers": bool(draft["brokers"]),
+        "symbols": bool(draft["symbols"]),
+        "patterns": bool(draft["patterns"]),
+        "ai": bool(ai.get("provider") and ai.get("has_api_key")),
+    }
+
+
+def primary_account_label(values: dict[str, str]) -> str:
+    if values.get("accountNumber"):
+        return values["accountNumber"]
+    if values.get("accountPrefix"):
+        suffix = values.get("accountProductCode", "")
+        return f"{values['accountPrefix']}-{suffix}" if suffix else values["accountPrefix"]
+    if values.get("htsId"):
+        return values["htsId"]
+    return "연결 정보"
+
+
+def upsert_broker_entry(draft: dict, broker: dict, values: dict[str, str]) -> None:
+    account_label = primary_account_label(values)
+    entry = {
+        "id": uuid4().hex[:10],
+        "broker_id": broker["id"],
+        "broker_name": broker["name"],
+        "environment": values.get("environment", "production"),
+        "account_label": account_label,
+        "saved_at": now_iso(),
+    }
+    existing = [
+        item
+        for item in draft["brokers"]
+        if not (
+            item["broker_id"] == entry["broker_id"]
+            and item["environment"] == entry["environment"]
+            and item["account_label"] == entry["account_label"]
+        )
+    ]
+    draft["brokers"] = [entry, *existing][:4]
+
+
+def add_symbol_entry(draft: dict, form: dict[str, str]) -> tuple[bool, str]:
+    broker_id = trim(form.get("brokerId"), 40)
+    symbol = trim(form.get("symbol"), 24).upper()
+    name = trim(form.get("symbolName"), 32) or symbol
+    market = trim(form.get("market"), 16) or "KRX"
+
+    if not broker_id or not symbol:
+        return False, "종목 코드와 연결할 증권사를 입력해야 합니다."
+
+    broker_entry = find_connected_broker(draft, broker_id)
+    if not broker_entry:
+        return False, "먼저 증권사를 추가해야 종목을 연결할 수 있습니다."
+
+    item = {
+        "id": uuid4().hex[:10],
+        "symbol": symbol,
+        "name": name,
+        "market": market,
+        "broker_id": broker_id,
+        "broker_name": broker_entry["broker_name"],
+    }
+
+    existing = [entry for entry in draft["symbols"] if not (entry["symbol"] == symbol and entry["broker_id"] == broker_id)]
+    draft["symbols"] = [item, *existing][:12]
+    return True, f"{name} 종목을 목록에 추가했습니다."
+
+
+def add_pattern_entry(draft: dict, form: dict[str, str]) -> tuple[bool, str]:
+    symbol_id = trim(form.get("symbolId"), 40)
+    pattern_type = trim(form.get("patternType"), 40)
+    schedule = trim(form.get("schedule"), 40)
+    budget = trim(form.get("budget"), 40)
+    note = trim(form.get("note"), 160)
+    buy_enabled = form.get("buyEnabled") == "on"
+    sell_enabled = form.get("sellEnabled") == "on"
+
+    if not symbol_id or not pattern_type or not schedule:
+        return False, "종목, 패턴, 주기를 모두 골라야 합니다."
+    if not buy_enabled and not sell_enabled:
+        return False, "자동 매수나 자동 매도 중 하나 이상을 켜야 합니다."
+
+    symbol_entry = find_symbol(draft, symbol_id)
+    if not symbol_entry:
+        return False, "먼저 종목을 추가한 뒤 패턴을 만들 수 있습니다."
+
+    pattern_label = next((item["label"] for item in PATTERN_OPTIONS if item["value"] == pattern_type), pattern_type)
+    schedule_label = next((item["label"] for item in SCHEDULE_OPTIONS if item["value"] == schedule), schedule)
+
+    draft["patterns"] = [
+        {
+            "id": uuid4().hex[:10],
+            "symbol_id": symbol_entry["id"],
+            "symbol": symbol_entry["symbol"],
+            "symbol_name": symbol_entry["name"],
+            "pattern_type": pattern_type,
+            "pattern_label": pattern_label,
+            "schedule": schedule,
+            "schedule_label": schedule_label,
+            "buy_enabled": buy_enabled,
+            "sell_enabled": sell_enabled,
+            "budget": budget,
+            "note": note,
+        },
+        *draft["patterns"],
+    ][:12]
+    return True, f"{symbol_entry['name']} 종목에 패턴을 추가했습니다."
+
+
+def save_ai_entry(draft: dict, form: dict[str, str]) -> tuple[bool, str]:
+    provider = trim(form.get("provider"), 40)
+    model = trim(form.get("model"), 80)
+    prompt = trim(form.get("prompt"), 320)
+    api_key = trim(form.get("apiKey"), 240)
+
+    if not provider or not model:
+        return False, "AI 제공사와 모델명을 먼저 입력해야 합니다."
+
+    draft["ai"] = {
+        "provider": provider,
+        "model": model,
+        "prompt": prompt,
+        "has_api_key": bool(api_key),
+        "updated_at": now_iso(),
+    }
+    return True, "AI 설정을 저장했습니다. API 키는 서버에 보관하지 않았습니다."
+
+
+def remove_item(items: list[dict], item_id: str) -> list[dict]:
+    return [item for item in items if item.get("id") != item_id]
+
+
+def render_select(name: str, label: str, options: list[dict[str, str]], value: str | None, help_text: str, required: bool = False) -> str:
+    required_tag = '<span class="field-chip">필수</span>' if required else '<span class="field-chip field-chip-muted">선택</span>'
+    options_html = "".join(
+        f'<option value="{html(option["value"])}"{selected_attr(value, option["value"])}>{html(option["label"])}</option>'
+        for option in options
+    )
+    return f"""
+    <div class="field">
+      <label for="{html(name)}">{html(label)} {required_tag}</label>
+      <select id="{html(name)}" name="{html(name)}">
+        {options_html}
+      </select>
+      <small>{html(help_text)}</small>
+    </div>
+    """
+
+
+def render_input(
+    name: str,
+    label: str,
+    value: str | None,
+    help_text: str,
+    *,
+    required: bool = False,
+    input_type: str = "text",
+    placeholder: str = "",
+) -> str:
+    required_tag = '<span class="field-chip">필수</span>' if required else '<span class="field-chip field-chip-muted">선택</span>'
+    return f"""
+    <div class="field">
+      <label for="{html(name)}">{html(label)} {required_tag}</label>
+      <input
+        id="{html(name)}"
+        name="{html(name)}"
+        type="{html(input_type)}"
+        value="{html(value or '')}"
+        placeholder="{html(placeholder)}"
+        autocomplete="off"
+      />
+      <small>{html(help_text)}</small>
+    </div>
+    """
+
+
+def render_textarea(name: str, label: str, value: str | None, help_text: str, *, required: bool = False, placeholder: str = "") -> str:
+    required_tag = '<span class="field-chip">필수</span>' if required else '<span class="field-chip field-chip-muted">선택</span>'
+    return f"""
+    <div class="field field-full">
+      <label for="{html(name)}">{html(label)} {required_tag}</label>
+      <textarea id="{html(name)}" name="{html(name)}" rows="5" placeholder="{html(placeholder)}">{html(value or '')}</textarea>
+      <small>{html(help_text)}</small>
+    </div>
+    """
+
+
+def render_message(message: dict | None) -> str:
+    if not message:
+        return ""
+    return f'<div class="message message-{html(message["kind"])}">{html(message["text"])}</div>'
+
+
+def render_progress(draft: dict) -> str:
+    state = compute_step_state(draft)
+    items = []
+    for step in STEP_CONFIG:
+        status = "완료" if state[step["key"]] else "대기"
+        classes = "progress-item is-complete" if state[step["key"]] else "progress-item"
+        items.append(
+            f"""
+            <div class="{classes}">
+              <span class="progress-number">{step["number"]}</span>
+              <div>
+                <strong>{html(step["label"])}</strong>
+                <span>{status}</span>
+              </div>
+            </div>
+            """
+        )
+    return "".join(items)
+
+
+def render_metric_cards(draft: dict) -> str:
     cards = [
-        ("전체 증권사/앱", counts["total"], "현재 목록에 포함된 대상"),
-        ("바로 연결 가능", counts["ready"], "self-service 공개 API 확인"),
-        ("제휴형/레거시", counts["partner"] + counts["limited"], "회사 승인 또는 추가 검증 필요"),
-        ("공개 주문 API 미확인", counts["unavailable"], "화면에는 사유만 우선 표시"),
+        ("연결된 증권", len(draft["brokers"]), "API 키는 저장하지 않고 연결 메타 정보만 보관"),
+        ("등록된 종목", len(draft["symbols"]), "처음에는 비어 있고 직접 추가해야 시작됩니다"),
+        ("자동매매 규칙", len(draft["patterns"]), "종목별 매수/매도 조건과 주기를 관리"),
+        ("AI 설정", "설정됨" if draft["ai"].get("provider") else "미설정", "AI 판단 보조는 마지막 단계에서 추가"),
     ]
     return "".join(
         f"""
-        <div class="summary-card">
+        <div class="metric-card">
           <span>{html(label)}</span>
-          <strong>{value}</strong>
-          <span>{html(note)}</span>
+          <strong>{html(value)}</strong>
+          <p>{html(note)}</p>
         </div>
         """
         for label, value, note in cards
     )
 
 
-def render_filters(filter_id: str) -> str:
-    parts: list[str] = []
-    for item in FILTERS:
-        classes = f"filter-pill{active_class(filter_id == item['id'], 'is-active')}"
-        href = build_url(filter=item["id"])
-        parts.append(
-            f"""
-            <a class="{classes}" href="{href}">
-              {html(item["label"])}
-            </a>
-            """
-        )
-    return "".join(parts)
+def render_profile_section(draft: dict, message: dict | None) -> str:
+    profile = draft["profile"]
+    return f"""
+    <section id="step-1" class="section-card">
+      <div class="section-header">
+        <div>
+          <span class="section-step">1</span>
+          <h2>회원가입</h2>
+          <p>서비스 기본 프로필을 먼저 잡아둡니다. 실제 인증은 나중에 붙여도 되지만, 흐름상 첫 단계에 두는 게 자연스럽습니다.</p>
+        </div>
+      </div>
+      {render_message(message)}
+      <form method="post" action="/wizard/profile" class="section-layout">
+        <div class="form-panel">
+          <div class="form-grid">
+            {render_input("nickname", "닉네임", profile.get("nickname"), "대시보드 상단에 표시할 이름", required=True, placeholder="예: 민우")}
+            {render_input("email", "이메일", profile.get("email"), "알림 메일이나 계정 복구에 쓸 주소", required=True, input_type="email", placeholder="name@example.com")}
+            {render_input("phone", "연락처", profile.get("phone"), "선택 사항. 추후 주문 알림용", placeholder="010-0000-0000")}
+          </div>
+          <div class="button-row">
+            <button class="button button-primary" type="submit">프로필 저장</button>
+          </div>
+        </div>
+        <div class="aside-panel">
+          <h3>이 단계에서 결정되는 것</h3>
+          <ul class="bullet-list">
+            <li>누가 이 자동매매 워크스페이스를 쓰는지</li>
+            <li>이후 단계에서 보여줄 기본 사용자 정보</li>
+            <li>알림/승인 흐름을 넣을 때 기준이 되는 계정 프로필</li>
+          </ul>
+        </div>
+      </form>
+    </section>
+    """
 
 
-def render_broker_list(filter_id: str, selected_id: str | None) -> str:
-    visible_brokers = get_visible_brokers(filter_id)
-    if not visible_brokers:
+def render_connected_brokers(draft: dict) -> str:
+    if not draft["brokers"]:
         return """
-        <div class="empty-state">
-          <h3>표시할 증권사가 없습니다.</h3>
-          <p>현재 필터에 맞는 대상이 없습니다. 다른 필터를 선택해 보세요.</p>
+        <div class="empty-card">
+          <h3>아직 연결된 증권이 없습니다.</h3>
+          <p>아래 3단계에서 키움, 한국투자, DB, LS 중 하나를 먼저 추가하면 여기부터 채워집니다.</p>
         </div>
         """
 
-    cards: list[str] = []
-    for broker in visible_brokers:
-        status = STATUS_META[broker["status"]]
-        capability_html = []
-        for key, label in CAPABILITY_CARDS:
-            capability = CAPABILITY_META[broker["capability"][key]]
-            capability_html.append(
-                f"""
-                <div class="compact-item">
-                  <span>{html(label)}</span>
-                  <strong class="cap-pill {html(capability['className'])}">{html(capability['label'])}</strong>
-                </div>
-                """
-            )
-
-        classes = f"broker-card{active_class(broker['id'] == selected_id, 'is-selected')}"
-        href = build_url(filter=filter_id, broker=broker["id"])
+    cards = []
+    for item in draft["brokers"]:
+        env_label = "실전" if item["environment"] == "production" else "모의"
         cards.append(
             f"""
-            <a class="{classes}" href="{href}">
-              <div class="broker-head">
-                <div class="broker-name-wrap">
-                  <h3 class="broker-name">{html(broker["name"])}</h3>
-                  <p class="broker-subtitle">{html(broker["subtitle"])}</p>
+            <div class="list-card">
+              <div class="list-card-head">
+                <div>
+                  <strong>{html(item["broker_name"])}</strong>
+                  <span>{html(item["account_label"])}</span>
                 </div>
-                <span class="status-badge {html(status['className'])}">{html(status['label'])}</span>
+                <span class="mini-status">{html(env_label)}</span>
               </div>
-              <p class="broker-summary">{html(broker["summary"])}</p>
-              <div class="cap-grid-compact">
-                {''.join(capability_html)}
-              </div>
-            </a>
+              <form method="post" action="/wizard/brokers/remove" class="inline-form">
+                <input type="hidden" name="itemId" value="{html(item['id'])}" />
+                <button class="button button-ghost button-small" type="submit">삭제</button>
+              </form>
+            </div>
             """
         )
     return "".join(cards)
 
 
-def render_validation_panel(result: dict | None) -> str:
-    if not result:
-        return ""
-
-    missing = result.get("missing_fields", [])
-    warnings = result.get("warnings", [])
-    if not result.get("is_supported"):
-        title = "현재는 self-service 입력을 열지 않는 상태입니다."
-    elif missing:
-        title = "필수 입력값이 비어 있습니다."
-    else:
-        title = "기본 필드 검증은 통과했습니다."
-
-    warning_html = ""
-    if warnings:
-        warning_html = f"""
-        <ul class="note-list">
-          {''.join(f"<li>{html(warning)}</li>" for warning in warnings)}
-        </ul>
-        """
-
-    missing_html = ""
-    if missing:
-        missing_html = f"""
-        <p class="helper-text">누락 필드: {html(', '.join(missing))}</p>
-        """
-
-    return f"""
-    <div class="empty-state">
-      <h3>{html(title)}</h3>
-      {missing_html}
-      {warning_html}
-    </div>
-    """
-
-
-def render_field(field: dict, value: str | None) -> str:
-    required = '<span class="required-mark">필수</span>' if field.get("required") else '<span class="required-mark">선택</span>'
-    if field["type"] == "select":
-        options = "".join(
-            f'<option value="{html(option["value"])}"{selected_value(value, option["value"])}>{html(option["label"])}</option>'
-            for option in field.get("options", [])
-        )
-        return f"""
-        <div class="field">
-          <label for="{html(field['key'])}">
-            {html(field['label'])}
-            {required}
-          </label>
-          <select id="{html(field['key'])}" name="{html(field['key'])}">
-            {options}
-          </select>
-          <small>{html(field.get("help", ""))}</small>
+def render_symbol_rows(draft: dict) -> str:
+    if not draft["symbols"]:
+        return """
+        <div class="empty-card">
+          <h3>주가 목록이 비어 있습니다.</h3>
+          <p>종목을 추가하면 여기서 연결된 증권사와 함께 관리됩니다. 현재가는 아직 미연동 상태라 빈 값으로 남겨둡니다.</p>
         </div>
         """
 
+    rows = []
+    for item in draft["symbols"]:
+        rule_count = sum(1 for pattern in draft["patterns"] if pattern["symbol_id"] == item["id"])
+        rows.append(
+            f"""
+            <div class="table-row">
+              <div>
+                <strong>{html(item["name"])}</strong>
+                <span>{html(item["symbol"])} · {html(item["market"])}</span>
+              </div>
+              <span>{html(item["broker_name"])}</span>
+              <span>미연동</span>
+              <span>{rule_count}개 규칙</span>
+              <form method="post" action="/wizard/symbols/remove" class="inline-form">
+                <input type="hidden" name="itemId" value="{html(item['id'])}" />
+                <button class="button button-ghost button-small" type="submit">삭제</button>
+              </form>
+            </div>
+            """
+        )
+    return "".join(rows)
+
+
+def render_pattern_list(draft: dict) -> str:
+    if not draft["patterns"]:
+        return """
+        <div class="empty-card">
+          <h3>자동매매 규칙이 없습니다.</h3>
+          <p>종목을 추가한 뒤에 매수/매도 패턴과 주기를 지정하면 여기서 한눈에 볼 수 있습니다.</p>
+        </div>
+        """
+
+    cards = []
+    for item in draft["patterns"]:
+        sides = []
+        if item["buy_enabled"]:
+            sides.append("자동 매수")
+        if item["sell_enabled"]:
+            sides.append("자동 매도")
+        budget = item["budget"] or "예산 미정"
+        note = item["note"] or "설명 없음"
+        cards.append(
+            f"""
+            <div class="list-card">
+              <div class="list-card-head">
+                <div>
+                  <strong>{html(item["symbol_name"])}</strong>
+                  <span>{html(item["pattern_label"])} · {html(item["schedule_label"])}</span>
+                </div>
+                <span class="mini-status">{html(' / '.join(sides))}</span>
+              </div>
+              <p class="list-note">{html(budget)} · {html(note)}</p>
+              <form method="post" action="/wizard/patterns/remove" class="inline-form">
+                <input type="hidden" name="itemId" value="{html(item['id'])}" />
+                <button class="button button-ghost button-small" type="submit">삭제</button>
+              </form>
+            </div>
+            """
+        )
+    return "".join(cards)
+
+
+def render_ai_summary(draft: dict) -> str:
+    ai = draft["ai"]
+    if not ai.get("provider"):
+        return """
+        <div class="empty-card">
+          <h3>AI 설정이 아직 없습니다.</h3>
+          <p>OpenAI나 Anthropic 같은 외부 모델을 연결하고, 텍스트 기반 규칙 프롬프트를 마지막 단계에서 추가합니다.</p>
+        </div>
+        """
+
+    provider_label = next((item["label"] for item in AI_PROVIDERS if item["value"] == ai["provider"]), ai["provider"])
+    prompt_preview = ai.get("prompt") or "프롬프트 없음"
     return f"""
-    <div class="field">
-      <label for="{html(field['key'])}">
-        {html(field['label'])}
-        {required}
-      </label>
-      <input
-        id="{html(field['key'])}"
-        name="{html(field['key'])}"
-        type="{html(field['type'])}"
-        value="{html(value or '')}"
-        placeholder="{html(field.get('placeholder', ''))}"
-        autocomplete="off"
-      />
-      <small>{html(field.get("help", ""))}</small>
+    <div class="list-card">
+      <div class="list-card-head">
+        <div>
+          <strong>{html(provider_label)}</strong>
+          <span>{html(ai.get("model", "모델 미지정"))}</span>
+        </div>
+        <span class="mini-status">{'API 키 입력됨' if ai.get('has_api_key') else 'API 키 미입력'}</span>
+      </div>
+      <p class="list-note">{html(prompt_preview)}</p>
+      <form method="post" action="/wizard/ai/clear" class="inline-form">
+        <button class="button button-ghost button-small" type="submit">초기화</button>
+      </form>
     </div>
     """
 
 
-def render_credential_panel(
-    broker: dict,
-    filter_id: str,
-    form_values: dict[str, str] | None,
-    validation_result: dict | None,
-) -> str:
-    if broker["status"] != "ready":
-        status = STATUS_META[broker["status"]]
-        return f"""
-        <div class="stack-card">
-          <h3>계정/API 입력</h3>
-          <div class="empty-state">
-            <h3>{html(status['label'])}</h3>
-            <p>
-              {html(status['description'])} 상태라서, 현재 버전에서는 이 증권사 전용 입력 폼을 열지 않았습니다.
-              먼저 안내 문구와 공식 링크를 검토한 뒤, 실제 제휴 승인 또는 세부 인증 검증이 끝나면 전용 폼을 추가하는 흐름이 안전합니다.
-            </p>
+def render_overview_section(draft: dict) -> str:
+    return f"""
+    <section id="step-2" class="section-card">
+      <div class="section-header">
+        <div>
+          <span class="section-step">2</span>
+          <h2>주가 목록</h2>
+          <p>처음에는 비어 있는 목록입니다. 증권을 연결하고 종목을 추가할수록 아래 보드가 채워집니다.</p>
+        </div>
+      </div>
+      <div class="metric-grid">
+        {render_metric_cards(draft)}
+      </div>
+      <div class="section-layout overview-layout">
+        <div class="panel-group">
+          <div class="panel-card">
+            <div class="panel-card-head">
+              <h3>연결된 증권 목록</h3>
+              <span>{len(draft["brokers"])}개</span>
+            </div>
+            <div class="stack-list">
+              {render_connected_brokers(draft)}
+            </div>
+          </div>
+          <div class="panel-card">
+            <div class="panel-card-head">
+              <h3>자동매매 패턴</h3>
+              <span>{len(draft["patterns"])}개</span>
+            </div>
+            <div class="stack-list">
+              {render_pattern_list(draft)}
+            </div>
           </div>
         </div>
-        """
-
-    values = normalize_form_values(broker, form_values or {})
-    fields_html = "".join(render_field(field, values.get(field["key"])) for field in broker.get("fields", []))
-    validation_html = render_validation_panel(validation_result)
-    action = f"/connections/{broker['id']}/validate"
-    export_action = f"/connections/{broker['id']}/export"
-
-    return f"""
-    <div class="stack-card">
-      <h3>계정/API 입력</h3>
-      <p class="security-banner">
-        지금은 <strong>브라우저 저장 없이 서버 렌더링만</strong> 합니다.
-        값 검증과 JSON 내보내기만 지원하고, 실제 저장과 주문 실행은 아직 붙이지 않았습니다.
-      </p>
-      {validation_html}
-      <form id="form-{html(broker['id'])}" method="post" action="{html(action)}">
-        <input type="hidden" name="uiFilter" value="{html(filter_id)}" />
-        <input type="hidden" name="uiBroker" value="{html(broker['id'])}" />
-        <div class="form-grid">
-          {fields_html}
+        <div class="panel-card">
+          <div class="panel-card-head">
+            <h3>종목 목록</h3>
+            <span>{len(draft["symbols"])}개</span>
+          </div>
+          <div class="table-head">
+            <span>종목</span>
+            <span>연결 증권</span>
+            <span>현재가</span>
+            <span>규칙</span>
+            <span></span>
+          </div>
+          <div class="table-body">
+            {render_symbol_rows(draft)}
+          </div>
+          <div class="panel-card-head panel-card-footer">
+            <h3>AI 연동</h3>
+            <span>{'완료' if draft['ai'].get('provider') else '대기'}</span>
+          </div>
+          {render_ai_summary(draft)}
         </div>
-        <div class="actions">
-          <button type="submit" class="action-btn action-primary">입력값 검증</button>
-          <button
-            type="submit"
-            class="action-btn action-secondary"
-            formaction="{html(export_action)}"
-            formmethod="post"
-          >
-            JSON 내보내기
-          </button>
-        </div>
-      </form>
-      <p class="helper-text">
-        이 값은 현재 세션에서만 검증에 사용됩니다. 실서비스 전환 시에는 서버 측 비밀정보 암호화 저장이 필요합니다.
-      </p>
-    </div>
+      </div>
+    </section>
     """
 
 
-def render_detail_card(
-    broker: dict | None,
-    filter_id: str,
-    form_values: dict[str, str] | None,
-    validation_result: dict | None,
-) -> str:
-    if not broker:
-        return """
-        <div class="empty-state">
-          <h3>표시할 증권사가 없습니다.</h3>
-          <p>현재 필터에 맞는 대상이 없습니다. 다른 필터를 선택해 보세요.</p>
-        </div>
-        """
+def render_capabilities(broker: dict) -> str:
+    items = []
+    labels = {"quote": "주가 확인", "buy": "자동 매수", "sell": "자동 매도", "balance": "잔고 확인"}
+    for key, label in labels.items():
+        capability = CAPABILITY_META[broker["capability"][key]]
+        items.append(f'<span class="capability-pill {html(capability["className"])}">{html(label)} · {html(capability["label"])}</span>')
+    return "".join(items)
 
+
+def render_broker_picker(selected_broker_id: str) -> str:
+    chips = []
+    for broker in BROKER_DETAILS:
+        status = STATUS_META[broker["status"]]
+        classes = "broker-chip is-active" if broker["id"] == selected_broker_id else "broker-chip"
+        chips.append(
+            f"""
+            <a class="{classes}" href="/?broker={html(broker['id'])}#step-3">
+              <strong>{html(broker['name'])}</strong>
+              <span>{html(status['label'])}</span>
+            </a>
+            """
+        )
+    return "".join(chips)
+
+
+def render_broker_form(broker: dict, values: dict[str, str], message: dict | None, validation: dict | None) -> str:
     status = STATUS_META[broker["status"]]
-    capability_cards = "".join(
-        f"""
-        <div class="capability-card">
-          <h3>{html(label)}</h3>
-          <span class="cap-pill {html(CAPABILITY_META[broker['capability'][key]]['className'])}">
-            {html(CAPABILITY_META[broker['capability'][key]]['label'])}
-          </span>
-        </div>
-        """
-        for key, label in CAPABILITY_CARDS
-    )
-
     guide_items = "".join(f"<li>{html(step)}</li>" for step in broker.get("steps", []))
-    notice_items = "".join(f"<li>{html(note)}</li>" for note in broker.get("notices", []))
     source_items = "".join(
         f'<li><a class="inline-link" href="{html(source["url"])}" target="_blank" rel="noreferrer">{html(source["label"])}</a></li>'
         for source in broker.get("sources", [])
     )
-    form_state = "현재 입력값 있음" if form_values else "아직 입력 없음"
-    credential_panel = render_credential_panel(broker, filter_id, form_values, validation_result)
+
+    if broker["status"] != "ready":
+        return f"""
+        <div class="panel-card">
+          <div class="panel-card-head">
+            <h3>{html(broker["name"])}</h3>
+            <span class="status-pill {html(status["className"])}">{html(status["label"])}</span>
+          </div>
+          <p class="section-copy">{html(broker["summary"])}</p>
+          <div class="capability-row">{render_capabilities(broker)}</div>
+          <div class="empty-card">
+            <h3>이 증권사는 지금 바로 연결하지 않습니다.</h3>
+            <p>{html(status["description"])} 상태라서, 현재는 안내와 공식 링크만 제공합니다.</p>
+          </div>
+          <div class="guide-grid">
+            <div>
+              <h4>확인 포인트</h4>
+              <ol class="bullet-list ordered-list">{guide_items}</ol>
+            </div>
+            <div>
+              <h4>공식 링크</h4>
+              <ul class="bullet-list">{source_items}</ul>
+            </div>
+          </div>
+        </div>
+        """
+
+    fields_html = []
+    for field in broker.get("fields", []):
+        if field["type"] == "select":
+            fields_html.append(
+                render_select(
+                    field["key"],
+                    field["label"],
+                    field.get("options", []),
+                    values.get(field["key"]),
+                    field.get("help", ""),
+                    required=field.get("required", False),
+                )
+            )
+        else:
+            fields_html.append(
+                render_input(
+                    field["key"],
+                    field["label"],
+                    values.get(field["key"]),
+                    field.get("help", ""),
+                    required=field.get("required", False),
+                    input_type="password" if field["type"] == "password" else "text",
+                    placeholder=field.get("placeholder", ""),
+                )
+            )
+
+    validation_html = ""
+    if validation:
+        missing = validation.get("missing_fields", [])
+        warnings = validation.get("warnings", [])
+        state_text = "기본 필드 검증 통과" if not missing and validation.get("is_supported") else "입력 보완 필요"
+        warning_items = "".join(f"<li>{html(item)}</li>" for item in warnings)
+        missing_text = f"누락 필드: {html(', '.join(missing))}" if missing else "누락된 필수 필드는 없습니다."
+        validation_html = f"""
+        <div class="message message-{'success' if not missing else 'warning'}">
+          <strong>{html(state_text)}</strong><br />
+          {missing_text}
+          {'<ul class="bullet-list compact-list">' + warning_items + '</ul>' if warnings else ''}
+        </div>
+        """
 
     return f"""
-    <article class="detail-card">
-      <section class="detail-hero">
-        <div class="detail-topline">
-          <p class="section-label">Broker Detail</p>
-          <span class="status-badge {html(status['className'])}">{html(status['label'])}</span>
-          <span class="mini-badge">{html(broker['audience'])}</span>
+    <div class="panel-card">
+      <div class="panel-card-head">
+        <div>
+          <h3>{html(broker["name"])}</h3>
+          <span>{html(broker["summary"])}</span>
         </div>
-        <h2 class="detail-title">{html(broker['name'])}</h2>
-        <p class="detail-summary">{html(broker['summary'])}</p>
-        <div class="callout-strip">
-          <div class="callout">
-            <span>적합한 용도</span>
-            <strong>{html(broker['fit'])}</strong>
+        <span class="status-pill {html(status["className"])}">{html(status["label"])}</span>
+      </div>
+      <div class="capability-row">{render_capabilities(broker)}</div>
+      {render_message(message)}
+      {validation_html}
+      <form method="post" action="/wizard/broker/add" class="form-grid">
+        <input type="hidden" name="selectedBrokerId" value="{html(broker['id'])}" />
+        {''.join(fields_html)}
+        <div class="field field-full">
+          <div class="button-row">
+            <button class="button button-primary" type="submit">증권 추가</button>
           </div>
-          <div class="callout">
-            <span>온보딩 방식</span>
-            <strong>{html(broker['onboardingMode'])}</strong>
+          <small>API 키 원문은 저장하지 않고, 연결된 증권 메타 정보만 이 브라우저에 임시 보관합니다.</small>
+        </div>
+      </form>
+      <div class="guide-grid">
+        <div>
+          <h4>가이드</h4>
+          <ol class="bullet-list ordered-list">{guide_items}</ol>
+        </div>
+        <div>
+          <h4>공식 링크</h4>
+          <ul class="bullet-list">{source_items}</ul>
+        </div>
+      </div>
+    </div>
+    """
+
+
+def render_broker_section(draft: dict, selected_broker_id: str, values: dict[str, str], message: dict | None, validation: dict | None) -> str:
+    broker = get_broker_or_none(selected_broker_id) or READY_BROKERS[0]
+    return f"""
+    <section id="step-3" class="section-card">
+      <div class="section-header">
+        <div>
+          <span class="section-step">3</span>
+          <h2>증권 추가</h2>
+          <p>지원 상태를 먼저 보고, 바로 연결 가능한 증권사만 단계적으로 붙입니다. 여기서는 계좌 메타 정보만 연결하고 실제 키는 저장하지 않습니다.</p>
+        </div>
+      </div>
+      <div class="broker-picker">{render_broker_picker(broker["id"])}</div>
+      {render_broker_form(broker, values, message, validation)}
+    </section>
+    """
+
+
+def render_symbol_section(draft: dict, values: dict[str, str], message: dict | None) -> str:
+    broker_options = [{"value": item["broker_id"], "label": f'{item["broker_name"]} · {item["account_label"]}'} for item in draft["brokers"]]
+    markets = [
+        {"value": "KRX", "label": "국내주식"},
+        {"value": "NASDAQ", "label": "미국주식"},
+        {"value": "NYSE", "label": "뉴욕거래소"},
+        {"value": "ETF", "label": "ETF"},
+    ]
+    empty = not broker_options
+    content = """
+      <div class="empty-card">
+        <h3>먼저 증권을 추가해야 합니다.</h3>
+        <p>3단계에서 하나 이상의 증권 계정을 등록해야 종목을 연결할 수 있습니다.</p>
+      </div>
+    """
+    if not empty:
+        content = f"""
+        <form method="post" action="/wizard/symbols/add" class="form-grid">
+          {render_select("brokerId", "연결 증권", broker_options, values.get("brokerId"), "어느 증권사 계좌로 이 종목을 관리할지 선택", required=True)}
+          {render_input("symbol", "종목 코드", values.get("symbol"), "예: 005930, AAPL", required=True, placeholder="005930")}
+          {render_input("symbolName", "종목명", values.get("symbolName"), "비워두면 종목 코드로 표시", placeholder="삼성전자")}
+          {render_select("market", "시장", markets, values.get("market") or "KRX", "국내/해외 구분용", required=True)}
+          <div class="field field-full">
+            <div class="button-row">
+              <button class="button button-primary" type="submit">종목 추가</button>
+            </div>
           </div>
-          <div class="callout">
-            <span>폼 상태</span>
-            <strong>{html(form_state)}</strong>
+        </form>
+        """
+
+    return f"""
+    <section id="step-4" class="section-card">
+      <div class="section-header">
+        <div>
+          <span class="section-step">4</span>
+          <h2>종목 추가</h2>
+          <p>자동매매 대상으로 보고 싶은 종목을 하나씩 담습니다. 처음엔 비어 있고, 연결한 증권과 짝을 지어 등록합니다.</p>
+        </div>
+      </div>
+      {render_message(message)}
+      <div class="section-layout">
+        <div class="form-panel">
+          {content}
+        </div>
+        <div class="aside-panel">
+          <h3>현재 종목 목록</h3>
+          <div class="stack-list">
+            {render_symbol_rows(draft)}
           </div>
         </div>
-      </section>
+      </div>
+    </section>
+    """
 
-      <section class="capability-matrix">
-        {capability_cards}
-      </section>
 
-      <section class="detail-grid">
-        <div class="stack-card">
-          <h3>신청 가이드</h3>
-          <ol class="guide-list">
-            {guide_items}
-          </ol>
+def render_pattern_section(draft: dict, values: dict[str, str], message: dict | None) -> str:
+    symbol_options = [{"value": item["id"], "label": f'{item["name"]} ({item["symbol"]})'} for item in draft["symbols"]]
+    content = """
+      <div class="empty-card">
+        <h3>먼저 종목을 추가해야 합니다.</h3>
+        <p>4단계에서 종목을 넣어야 어떤 종목에 어떤 패턴을 적용할지 고를 수 있습니다.</p>
+      </div>
+    """
+    if symbol_options:
+        content = f"""
+        <form method="post" action="/wizard/patterns/add" class="form-grid">
+          {render_select("symbolId", "대상 종목", symbol_options, values.get("symbolId"), "어떤 종목에 규칙을 붙일지 선택", required=True)}
+          {render_select("patternType", "패턴", PATTERN_OPTIONS, values.get("patternType"), "매수/매도 조건 템플릿", required=True)}
+          {render_select("schedule", "주기", SCHEDULE_OPTIONS, values.get("schedule"), "얼마나 자주 확인할지", required=True)}
+          {render_input("budget", "예산/한도", values.get("budget"), "예: 회당 30만원, 보유분 20% 매도", placeholder="회당 30만원")}
+          <div class="field">
+            <label>매수/매도 활성화</label>
+            <div class="toggle-group">
+              <label class="toggle-item"><input type="checkbox" name="buyEnabled"{checked_attr(values.get("buyEnabled") == "on")} /> 자동 매수</label>
+              <label class="toggle-item"><input type="checkbox" name="sellEnabled"{checked_attr(values.get("sellEnabled") == "on")} /> 자동 매도</label>
+            </div>
+            <small>둘 중 하나 이상 선택해야 규칙이 저장됩니다.</small>
+          </div>
+          {render_textarea("note", "설명", values.get("note"), "예: 5% 하락 시 분할매수, 8% 상승 시 절반 매도", placeholder="조건 설명을 자유롭게 적어도 됩니다.")}
+          <div class="field field-full">
+            <div class="button-row">
+              <button class="button button-primary" type="submit">패턴 추가</button>
+            </div>
+          </div>
+        </form>
+        """
+
+    return f"""
+    <section id="step-5" class="section-card">
+      <div class="section-header">
+        <div>
+          <span class="section-step">5</span>
+          <h2>패턴 설정</h2>
+          <p>종목별로 자동 매수와 자동 매도를 어떤 패턴으로 돌릴지, 그리고 얼마나 자주 체크할지 정합니다.</p>
         </div>
-
-        {credential_panel}
-      </section>
-
-      <section class="detail-grid">
-        <div class="stack-card">
-          <h3>주의사항</h3>
-          <ul class="note-list">
-            {notice_items}
-          </ul>
+      </div>
+      {render_message(message)}
+      <div class="section-layout">
+        <div class="form-panel">
+          {content}
         </div>
-        <div class="stack-card">
-          <h3>공식 링크</h3>
-          <ul class="source-list">
-            {source_items}
-          </ul>
+        <div class="aside-panel">
+          <h3>현재 자동매매 규칙</h3>
+          <div class="stack-list">
+            {render_pattern_list(draft)}
+          </div>
         </div>
-      </section>
-    </article>
+      </div>
+    </section>
+    """
+
+
+def render_ai_section(draft: dict, values: dict[str, str], message: dict | None) -> str:
+    ai = draft["ai"]
+    provider_value = values.get("provider") or ai.get("provider")
+    model_value = values.get("model") or ai.get("model")
+    prompt_value = values.get("prompt") or ai.get("prompt")
+    return f"""
+    <section id="step-6" class="section-card">
+      <div class="section-header">
+        <div>
+          <span class="section-step">6</span>
+          <h2>AI API 추가</h2>
+          <p>마지막 단계에서는 외부 AI 모델을 붙이고, 자연어 텍스트로 패턴을 설명합니다. 실제 주문 전에는 항상 별도 룰 엔진 검증이 필요합니다.</p>
+        </div>
+      </div>
+      {render_message(message)}
+      <div class="section-layout">
+        <div class="form-panel">
+          <form method="post" action="/wizard/ai/save" class="form-grid">
+            {render_select("provider", "AI 제공사", AI_PROVIDERS, provider_value or "openai", "OpenAI, Anthropic, Google 등", required=True)}
+            {render_input("model", "모델명", model_value, "예: gpt-5, claude-sonnet, gemini-pro", required=True, placeholder="gpt-5")}
+            {render_input("apiKey", "API 키", "", "입력 즉시 사용하고 저장은 하지 않습니다.", required=True, input_type="password", placeholder="sk-...")}
+            {render_textarea("prompt", "패턴 프롬프트", prompt_value, "예: 삼성전자는 장중 변동성이 2% 이상이면 분할매수, 5% 수익이면 절반 매도", required=True, placeholder="자연어로 패턴을 적어주세요.")}
+            <div class="field field-full">
+              <div class="button-row">
+                <button class="button button-primary" type="submit">AI 설정 저장</button>
+              </div>
+            </div>
+          </form>
+        </div>
+        <div class="aside-panel">
+          <h3>현재 AI 설정</h3>
+          {render_ai_summary(draft)}
+          <div class="empty-card subtle-card">
+            <h3>다음 단계</h3>
+            <p>이 다음부터는 실제 브로커 어댑터, 시세 조회, 패턴 워커, 주문 승인/리스크 검증을 붙이면 됩니다.</p>
+          </div>
+        </div>
+      </div>
+    </section>
     """
 
 
 def render_home_page(
-    filter_id: str,
-    selected_broker_id: str | None,
-    form_values: dict[str, str] | None = None,
-    validation_result: dict | None = None,
+    draft: dict,
+    *,
+    selected_broker_id: str | None = None,
+    profile_message: dict | None = None,
+    broker_message: dict | None = None,
+    broker_validation: dict | None = None,
+    broker_values: dict[str, str] | None = None,
+    symbol_message: dict | None = None,
+    symbol_values: dict[str, str] | None = None,
+    pattern_message: dict | None = None,
+    pattern_values: dict[str, str] | None = None,
+    ai_message: dict | None = None,
+    ai_values: dict[str, str] | None = None,
+    page_message: dict | None = None,
 ) -> bytes:
-    normalized_filter = normalize_filter(filter_id)
-    selected_broker = get_selected_broker(normalized_filter, selected_broker_id)
-    selected_id = selected_broker["id"] if selected_broker else None
-
+    selected = selected_broker_id or READY_BROKERS[0]["id"]
     document = f"""<!doctype html>
 <html lang="ko">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Stock Broker Onboarding Hub</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=VT323&display=swap"
-      rel="stylesheet"
-    />
+    <title>Auto Trading Setup Flow</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="page-shell">
-      <div class="top-statusbar">
-        <span>SYS: PYTHON-RENDER</span>
-        <span>MODE: TOY-PROJECT</span>
-        <span>DATE: {BUILD_DATE}</span>
-        <span>PROFILE: MULTI-BROKER</span>
-      </div>
-      <header class="hero">
+    <div class="app-shell">
+      <header class="hero-card">
         <div class="hero-copy">
-          <p class="boot-line">C:\\TRADER\\BOOT&gt; render --python --brokers --setup-guide</p>
-          <p class="eyebrow">Multi-Broker Setup</p>
-          <h1>증권사 API 키와 계좌 정보를 Python 중심으로 정리하는 허브</h1>
-          <p class="hero-text">
-            회원가입과 계좌개설은 각 증권사에서 직접 진행하고, 이 화면에서는
-            자동매매에 필요한 <strong>계좌번호</strong>,
-            <strong>App Key/App Secret</strong>, <strong>추가 식별값</strong>만
-            다룹니다. 브로커 메타데이터, 필터링, 상세 가이드, 입력 검증, JSON 내보내기를
-            모두 Python 서버가 직접 처리합니다.
+          <span class="hero-kicker">Auto Trading Setup</span>
+          <h1>한 번에 다 보여주지 말고, 순서대로 설정하는 자동매매 온보딩</h1>
+          <p>
+            회원가입부터 증권 추가, 종목 선택, 자동 매수/매도 패턴, AI API 연결까지
+            단계별로 쌓아가는 구조입니다. 모바일에서도 위에서 아래로 내려가며 입력할 수 있게
+            구성했습니다.
           </p>
         </div>
-        <div class="hero-meta">
-          <div class="meta-card">
-            <span class="meta-label">공통 목표</span>
-            <strong>시세 확인 · 매수 · 매도 · 잔고 조회</strong>
+        <div class="hero-side">
+          <div class="hero-stat">
+            <span>배포 버전</span>
+            <strong>{BUILD_DATE}</strong>
           </div>
-          <div class="meta-card">
-            <span class="meta-label">현재 기준</span>
-            <strong>{BUILD_DATE} 반영</strong>
+          <div class="hero-stat">
+            <span>지원 증권</span>
+            <strong>{len(BROKER_DETAILS)}개</strong>
           </div>
-          <div class="meta-card">
-            <span class="meta-label">실행 엔진</span>
-            <strong>Python HTTP Server</strong>
-          </div>
+          <form method="post" action="/wizard/reset">
+            <button class="button button-ghost" type="submit">임시 설정 초기화</button>
+          </form>
         </div>
       </header>
 
-      <section class="summary-section">
-        <div class="summary-grid">
-          {render_summary_cards()}
-        </div>
-        <div class="legend">
-          <span class="legend-item">
-            <span class="dot dot-ready"></span> 바로 연결 가능
-          </span>
-          <span class="legend-item">
-            <span class="dot dot-partner"></span> 제휴형
-          </span>
-          <span class="legend-item">
-            <span class="dot dot-limited"></span> 레거시/확인 필요
-          </span>
-          <span class="legend-item">
-            <span class="dot dot-unavailable"></span> 공개 주문 API 미확인
-          </span>
+      {render_message(page_message)}
+
+      <section class="progress-card">
+        <div class="progress-grid">
+          {render_progress(draft)}
         </div>
       </section>
 
-      <main class="workspace">
-        <aside class="catalog-panel">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Broker Catalog</p>
-              <h2>증권사 목록</h2>
-            </div>
-            <div class="filter-pills">
-              {render_filters(normalized_filter)}
-            </div>
-          </div>
-          <div class="broker-list">
-            {render_broker_list(normalized_filter, selected_id)}
-          </div>
-        </aside>
-
-        <section class="detail-panel">
-          {render_detail_card(selected_broker, normalized_filter, form_values, validation_result)}
-        </section>
+      <main class="flow-stack">
+        {render_profile_section(draft, profile_message)}
+        {render_overview_section(draft)}
+        {render_broker_section(draft, selected, broker_values or {}, broker_message, broker_validation)}
+        {render_symbol_section(draft, symbol_values or {}, symbol_message)}
+        {render_pattern_section(draft, pattern_values or {}, pattern_message)}
+        {render_ai_section(draft, ai_values or {}, ai_message)}
       </main>
-
-      <footer class="footer-note">
-        <p>
-          현재 버전은 Python 서버 중심 프로토타입입니다. 다음 단계에서는 계좌/키 암호화 저장,
-          브로커 어댑터, 패턴 감시 워커, AI 신호 엔진을 추가해야 합니다.
-        </p>
-      </footer>
     </div>
   </body>
 </html>
@@ -491,113 +1005,53 @@ def render_home_page(
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "StockBrokerOnboardingPython/0.2"
+    server_version = "StockBrokerOnboardingPython/0.3"
 
     def _send_bytes(
         self,
         status: HTTPStatus,
         body: bytes,
         content_type: str,
-        headers: dict[str, str] | None = None,
+        *,
         include_body: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        for key, value in (headers or {}).items():
+        for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
         if include_body:
             self.wfile.write(body)
 
+    def _send_html(self, body: bytes, *, include_body: bool = True, extra_headers: dict[str, str] | None = None) -> None:
+        self._send_bytes(
+            HTTPStatus.OK,
+            body,
+            "text/html; charset=utf-8",
+            include_body=include_body,
+            extra_headers=extra_headers,
+        )
+
     def _send_json(
         self,
         status: HTTPStatus,
         payload: dict | list,
+        *,
         include_body: bool = True,
-        headers: dict[str, str] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        self._send_bytes(status, body, "application/json; charset=utf-8", headers=headers, include_body=include_body)
-
-    def _send_html(self, body: bytes, include_body: bool = True) -> None:
-        self._send_bytes(HTTPStatus.OK, body, "text/html; charset=utf-8", include_body=include_body)
-
-    def _send_html_status(self, status: HTTPStatus, body: bytes, include_body: bool = True) -> None:
-        self._send_bytes(status, body, "text/html; charset=utf-8", include_body=include_body)
-
-    def _send_static_file(self, target: Path, include_body: bool = True) -> None:
-        body = target.read_bytes()
-        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        self._send_bytes(HTTPStatus.OK, body, content_type, include_body=include_body)
-
-    def _parse_form_body(self) -> dict[str, str]:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length).decode("utf-8")
-        parsed = parse_qs(raw, keep_blank_values=True)
-        return {key: values[-1] if values else "" for key, values in parsed.items()}
-
-    def _handle_home(self, query: dict[str, list[str]], include_body: bool) -> None:
-        filter_id = query.get("filter", ["all"])[-1]
-        broker_id = query.get("broker", [""])[-1] or None
-        body = render_home_page(filter_id=filter_id, selected_broker_id=broker_id)
-        self._send_html(body, include_body=include_body)
-
-    def _handle_healthz(self, include_body: bool) -> None:
-        self._send_json(
-            HTTPStatus.OK,
-            {"status": "ok", "service": "stock-broker-onboarding-python", "brokers": len(BROKER_DETAILS)},
+        self._send_bytes(
+            status,
+            body,
+            "application/json; charset=utf-8",
             include_body=include_body,
+            extra_headers=extra_headers,
         )
 
-    def _handle_brokers_api(self, include_body: bool) -> None:
-        payload = {"items": BROKER_CATALOG}
-        self._send_json(HTTPStatus.OK, payload, include_body=include_body)
-
-    def _handle_broker_detail_api(self, broker_id: str, include_body: bool) -> None:
-        broker = get_broker_or_none(broker_id)
-        if not broker:
-            self._send_json(HTTPStatus.NOT_FOUND, {"detail": "broker_not_found"}, include_body=include_body)
-            return
-        self._send_json(HTTPStatus.OK, broker, include_body=include_body)
-
-    def _handle_api_validation(self, include_body: bool) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        broker = get_broker_or_none(payload.get("broker_id"))
-        if not broker:
-            self._send_json(HTTPStatus.NOT_FOUND, {"detail": "broker_not_found"}, include_body=include_body)
-            return
-        result = validate_broker_values(broker, payload.get("values", {}))
-        self._send_json(HTTPStatus.OK, result, include_body=include_body)
-
-    def _handle_connection_action(self, broker_id: str, action: str, include_body: bool) -> None:
-        broker = get_broker_or_none(broker_id)
-        if not broker:
-            self._send_json(HTTPStatus.NOT_FOUND, {"detail": "broker_not_found"}, include_body=include_body)
-            return
-
-        form = self._parse_form_body()
-        filter_id = form.pop("uiFilter", "all")
-        form.pop("uiBroker", None)
-        values = normalize_form_values(broker, form)
-
-        if action == "validate":
-            result = validate_broker_values(broker, values)
-            body = render_home_page(filter_id=filter_id, selected_broker_id=broker_id, form_values=values, validation_result=result)
-            self._send_html(body, include_body=include_body)
-            return
-
-        payload = {
-            "brokerId": broker["id"],
-            "brokerName": broker["name"],
-            "exportedAt": datetime.now(timezone.utc).isoformat(),
-            "values": values,
-        }
-        headers = {"Content-Disposition": f'attachment; filename="{broker["id"]}-credentials.json"'}
-        self._send_json(HTTPStatus.OK, payload, include_body=include_body, headers=headers)
-
-    def _handle_static(self, path: str, include_body: bool) -> bool:
+    def _send_static(self, path: str, *, include_body: bool) -> bool:
         relative = path.lstrip("/")
         if not relative:
             return False
@@ -608,36 +1062,64 @@ class AppHandler(BaseHTTPRequestHandler):
             return False
         if not target.is_file():
             return False
-        self._send_static_file(target, include_body=include_body)
+        body = target.read_bytes()
+        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        self._send_bytes(HTTPStatus.OK, body, content_type, include_body=include_body)
         return True
 
-    def _route_get(self, include_body: bool) -> None:
+    def _draft(self) -> dict:
+        return load_draft(self.headers.get("Cookie"))
+
+    def _read_form(self) -> dict[str, str]:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8")
+        parsed = parse_qs(raw, keep_blank_values=True)
+        return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+    def _render_with_cookie(self, draft: dict, html_body: bytes) -> None:
+        self._send_html(html_body, extra_headers={"Set-Cookie": draft_cookie_header(draft)})
+
+    def _route_get(self, *, include_body: bool) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query, keep_blank_values=True)
 
         if path in {"/", "/index.html"}:
-            self._handle_home(query, include_body=include_body)
+            draft = self._draft()
+            selected_broker = query.get("broker", [READY_BROKERS[0]["id"]])[-1]
+            body = render_home_page(draft, selected_broker_id=selected_broker)
+            self._send_html(body, include_body=include_body)
             return
+
         if path == "/healthz":
-            self._handle_healthz(include_body=include_body)
+            self._send_json(
+                HTTPStatus.OK,
+                {"status": "ok", "service": "stock-broker-onboarding-python", "brokers": len(BROKER_DETAILS)},
+                include_body=include_body,
+            )
             return
+
         if path == "/api/v1/brokers":
-            self._handle_brokers_api(include_body=include_body)
+            self._send_json(HTTPStatus.OK, {"items": BROKER_CATALOG}, include_body=include_body)
             return
+
+        if path.startswith("/api/v1/brokers/"):
+            broker_id = path.rsplit("/", 1)[-1]
+            broker = get_broker_or_none(broker_id)
+            if not broker:
+                self._send_json(HTTPStatus.NOT_FOUND, {"detail": "broker_not_found"}, include_body=include_body)
+                return
+            self._send_json(HTTPStatus.OK, broker, include_body=include_body)
+            return
+
         if path == "/favicon.ico":
             self._send_bytes(HTTPStatus.NO_CONTENT, b"", "image/x-icon", include_body=include_body)
             return
 
-        match = BROKER_API_ROUTE.match(path)
-        if match:
-            self._handle_broker_detail_api(match.group("broker_id"), include_body=include_body)
+        if self._send_static(path, include_body=include_body):
             return
 
-        if self._handle_static(path, include_body=include_body):
-            return
-
-        self._send_html_status(HTTPStatus.NOT_FOUND, b"<h1>404</h1><p>Not found</p>", include_body=include_body)
+        self._send_bytes(HTTPStatus.NOT_FOUND, b"Not found", "text/plain; charset=utf-8", include_body=include_body)
 
     def do_GET(self) -> None:
         self._route_get(include_body=True)
@@ -648,14 +1130,129 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        draft = self._draft()
 
         if path == "/api/v1/account-connections/validate":
-            self._handle_api_validation(include_body=True)
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            broker = get_broker_or_none(payload.get("broker_id"))
+            if not broker:
+                self._send_json(HTTPStatus.NOT_FOUND, {"detail": "broker_not_found"})
+                return
+            result = validate_broker_values(broker, payload.get("values", {}))
+            self._send_json(HTTPStatus.OK, result)
             return
 
-        match = CONNECTION_ROUTE.match(path)
-        if match:
-            self._handle_connection_action(match.group("broker_id"), match.group("action"), include_body=True)
+        if path == "/wizard/reset":
+            body = render_home_page(fresh_draft(), page_message={"kind": "success", "text": "임시 설정을 모두 초기화했습니다."})
+            self._send_html(body, extra_headers={"Set-Cookie": clear_cookie_header()})
+            return
+
+        form = self._read_form()
+
+        if path == "/wizard/profile":
+            draft["profile"] = {
+                "nickname": trim(form.get("nickname"), 32),
+                "email": trim(form.get("email"), 120),
+                "phone": trim(form.get("phone"), 32),
+            }
+            body = render_home_page(draft, profile_message={"kind": "success", "text": "프로필을 저장했습니다."})
+            self._render_with_cookie(draft, body)
+            return
+
+        if path == "/wizard/broker/add":
+            selected_broker = form.get("selectedBrokerId") or READY_BROKERS[0]["id"]
+            broker = get_broker_or_none(selected_broker)
+            if not broker:
+                body = render_home_page(draft, page_message={"kind": "warning", "text": "선택한 증권사를 찾지 못했습니다."})
+                self._send_html(body)
+                return
+            validation = validate_broker_values(broker, form)
+            if validation["is_supported"] and not validation["missing_fields"]:
+                upsert_broker_entry(draft, broker, form)
+                body = render_home_page(
+                    draft,
+                    selected_broker_id=selected_broker,
+                    broker_message={"kind": "success", "text": f"{broker['name']} 증권을 연결 목록에 추가했습니다."},
+                    broker_validation=validation,
+                    broker_values={},
+                )
+                self._render_with_cookie(draft, body)
+                return
+
+            body = render_home_page(
+                draft,
+                selected_broker_id=selected_broker,
+                broker_message={"kind": "warning", "text": "필수 입력을 확인한 뒤 다시 추가해 주세요."},
+                broker_validation=validation,
+                broker_values=form,
+            )
+            self._send_html(body)
+            return
+
+        if path == "/wizard/brokers/remove":
+            draft["brokers"] = remove_item(draft["brokers"], trim(form.get("itemId"), 40))
+            body = render_home_page(draft, broker_message={"kind": "success", "text": "증권 연결을 삭제했습니다."})
+            self._render_with_cookie(draft, body)
+            return
+
+        if path == "/wizard/symbols/add":
+            success, text = add_symbol_entry(draft, form)
+            body = render_home_page(
+                draft,
+                symbol_message={"kind": "success" if success else "warning", "text": text},
+                symbol_values={} if success else form,
+            )
+            if success:
+                self._render_with_cookie(draft, body)
+            else:
+                self._send_html(body)
+            return
+
+        if path == "/wizard/symbols/remove":
+            removed_id = trim(form.get("itemId"), 40)
+            draft["symbols"] = remove_item(draft["symbols"], removed_id)
+            draft["patterns"] = [pattern for pattern in draft["patterns"] if pattern.get("symbol_id") != removed_id]
+            body = render_home_page(draft, symbol_message={"kind": "success", "text": "종목과 연결된 규칙을 함께 삭제했습니다."})
+            self._render_with_cookie(draft, body)
+            return
+
+        if path == "/wizard/patterns/add":
+            success, text = add_pattern_entry(draft, form)
+            body = render_home_page(
+                draft,
+                pattern_message={"kind": "success" if success else "warning", "text": text},
+                pattern_values={} if success else form,
+            )
+            if success:
+                self._render_with_cookie(draft, body)
+            else:
+                self._send_html(body)
+            return
+
+        if path == "/wizard/patterns/remove":
+            draft["patterns"] = remove_item(draft["patterns"], trim(form.get("itemId"), 40))
+            body = render_home_page(draft, pattern_message={"kind": "success", "text": "자동매매 규칙을 삭제했습니다."})
+            self._render_with_cookie(draft, body)
+            return
+
+        if path == "/wizard/ai/save":
+            success, text = save_ai_entry(draft, form)
+            body = render_home_page(
+                draft,
+                ai_message={"kind": "success" if success else "warning", "text": text},
+                ai_values={} if success else form,
+            )
+            if success:
+                self._render_with_cookie(draft, body)
+            else:
+                self._send_html(body)
+            return
+
+        if path == "/wizard/ai/clear":
+            draft["ai"] = {"provider": "", "model": "", "prompt": "", "has_api_key": False}
+            body = render_home_page(draft, ai_message={"kind": "success", "text": "AI 설정을 초기화했습니다."})
+            self._render_with_cookie(draft, body)
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not_found"})

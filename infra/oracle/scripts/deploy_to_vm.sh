@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 STATE_FILE="${PROJECT_ROOT}/.deploy/oracle/instance.json"
-REMOTE_USER="${REMOTE_USER:-opc}"
+REMOTE_USER="${REMOTE_USER:-}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/stock-broker-onboarding}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-$HOME/.ssh/id_rsa}"
 
@@ -23,6 +23,20 @@ PY
 
 if [[ -z "${PUBLIC_IP}" ]]; then
   echo "public_ip missing in ${STATE_FILE}" >&2
+  exit 1
+fi
+
+if [[ -z "${REMOTE_USER}" ]]; then
+  for candidate in ubuntu opc ec2-user; do
+    if ssh -i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5 "${candidate}@${PUBLIC_IP}" "true" >/dev/null 2>&1; then
+      REMOTE_USER="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${REMOTE_USER}" ]]; then
+  echo "failed to detect remote user; set REMOTE_USER explicitly" >&2
   exit 1
 fi
 
