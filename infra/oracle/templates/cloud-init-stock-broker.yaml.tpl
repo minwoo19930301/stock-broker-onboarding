@@ -9,15 +9,7 @@ write_files:
 
       APP_DIR="/opt/stock-broker-onboarding"
       TMP_BUNDLE="/tmp/stock-broker-onboarding.tar.gz"
-
-      if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        if command -v dnf >/dev/null 2>&1; then
-          dnf install -y curl tar
-        elif command -v apt-get >/dev/null 2>&1; then
-          apt-get update
-          apt-get install -y curl tar
-        fi
-      fi
+      SERVICE_PATH="/etc/systemd/system/stock-broker-onboarding.service"
 
       mkdir -p /opt
       chown __APP_USER__:__APP_USER__ /opt
@@ -29,8 +21,30 @@ write_files:
       tar -xzf "${TMP_BUNDLE}" -C "${APP_DIR}"
       chown -R __APP_USER__:__APP_USER__ "${APP_DIR}"
 
-      cd "${APP_DIR}"
-      chmod +x infra/oracle/scripts/bootstrap_oracle_ubuntu.sh
-      APP_USER="__APP_USER__" APP_GROUP="__APP_USER__" SERVER_NAME="_" ./infra/oracle/scripts/bootstrap_oracle_ubuntu.sh 2>&1 | tee /var/log/stock-broker-bootstrap.log
+      cat > "${SERVICE_PATH}" <<'EOF'
+      [Unit]
+      Description=Stock Broker Onboarding Static Server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      WorkingDirectory=/opt/stock-broker-onboarding
+      ExecStart=/usr/bin/python3 /opt/stock-broker-onboarding/server.py
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+
+      systemctl daemon-reload
+      systemctl enable stock-broker-onboarding.service
+      systemctl restart stock-broker-onboarding.service
+
+      if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        firewall-cmd --permanent --add-service=http || true
+        firewall-cmd --reload || true
+      fi
 runcmd:
   - [ bash, -lc, /usr/local/bin/stock-broker-firstboot.sh ]
