@@ -19,6 +19,7 @@ CIDR_BLOCK = os.getenv("OCI_VCN_CIDR", "10.0.0.0/16")
 SUBNET_CIDR = os.getenv("OCI_SUBNET_CIDR", "10.0.0.0/24")
 SHAPE_PREFERENCE = os.getenv("OCI_SHAPE_PREFERENCE", "VM.Standard.A1.Flex,VM.Standard.E2.1.Micro").split(",")
 SSH_PUBLIC_KEY_PATH = os.getenv("OCI_SSH_PUBLIC_KEY_PATH", str(Path.home() / ".ssh" / "id_rsa.pub"))
+SSH_SOURCE_CIDR = os.getenv("OCI_SSH_SOURCE_CIDR", "0.0.0.0/0").strip() or "0.0.0.0/0"
 STATE_DIR = Path(os.getenv("OCI_STATE_DIR", ".deploy/oracle"))
 STATE_FILE = STATE_DIR / "instance.json"
 IMAGE_OS_PREFERENCE = os.getenv("OCI_IMAGE_OS_PREFERENCE", "").strip()
@@ -113,17 +114,28 @@ def ensure_route(network_client, route_table_id: str, igw_id: str):
 def ensure_security_rules(network_client, security_list_id: str):
     security_list = network_client.get_security_list(security_list_id).data
     ingress_rules = security_list.ingress_security_rules or []
-    existing_ports = set()
+    existing_port_sources = set()
     for rule in ingress_rules:
-        if rule.source == "0.0.0.0/0" and rule.protocol == "6" and rule.tcp_options:
-            existing_ports.add((rule.tcp_options.destination_port_range.min, rule.tcp_options.destination_port_range.max))
+        if rule.protocol == "6" and rule.tcp_options:
+            existing_port_sources.add(
+                (
+                    rule.tcp_options.destination_port_range.min,
+                    rule.tcp_options.destination_port_range.max,
+                    rule.source,
+                )
+            )
 
-    for port in (22, 80, 443):
-        if (port, port) not in existing_ports:
+    ingress_targets = {
+        22: SSH_SOURCE_CIDR,
+        80: "0.0.0.0/0",
+        443: "0.0.0.0/0",
+    }
+    for port, source in ingress_targets.items():
+        if (port, port, source) not in existing_port_sources:
             ingress_rules.append(
                 oci.core.models.IngressSecurityRule(
                     protocol="6",
-                    source="0.0.0.0/0",
+                    source=source,
                     tcp_options=oci.core.models.TcpOptions(
                         destination_port_range=oci.core.models.PortRange(min=port, max=port)
                     ),
