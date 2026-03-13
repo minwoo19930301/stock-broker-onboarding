@@ -41,7 +41,10 @@ fi
 
 echo "[2/7] create virtual environment"
 cd "${BACKEND_ROOT}"
-python3 -m venv .venv
+if ! python3 -m venv .venv; then
+  python3 -m pip install --user virtualenv
+  python3 -m virtualenv .venv
+fi
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt

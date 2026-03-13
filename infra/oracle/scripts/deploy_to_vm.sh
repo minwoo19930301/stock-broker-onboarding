@@ -33,6 +33,7 @@ rsync -av --delete \
   --exclude '.git/' \
   --exclude '.tools/' \
   --exclude '.deploy/' \
+  --exclude '._*' \
   --exclude 'backend/.venv/' \
   -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=accept-new" \
   "${PROJECT_ROOT}/" "${REMOTE_USER}@${PUBLIC_IP}:${REMOTE_DIR}/"
