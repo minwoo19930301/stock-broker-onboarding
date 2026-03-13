@@ -22,7 +22,6 @@ if [[ ! -x "${OCI_BIN}" ]]; then
 fi
 
 tar \
-  --exclude='.git' \
   --exclude='.tools' \
   --exclude='.deploy' \
   --exclude='._*' \

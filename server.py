@@ -5,6 +5,8 @@ import base64
 import json
 import mimetypes
 import os
+import secrets
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
@@ -12,7 +14,9 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from backend.app.catalog import (
@@ -26,12 +30,35 @@ from backend.app.catalog import (
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def load_env_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_env_file(ROOT / ".env")
+
 COOKIE_NAME = "stock_broker_wizard_v2"
 BUILD_DATE = "2026-03-13"
 PROJECT_TITLE = "AUTO STOCK TRADER(KR)"
 PROJECT_SLUG = "auto-stock-trader-kr"
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip()
 READY_BROKERS = [broker for broker in BROKER_DETAILS if broker["status"] == "ready"]
 MODAL_KEYS = {"broker", "symbol", "pattern", "ai"}
+REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "12"))
+
+# Runtime-only stores for a toy project. They are reset when the process restarts.
+OAUTH_PENDING: dict[str, dict] = {}
+BROKER_SECRET_STORE: dict[str, dict[str, dict]] = {}
+BROKER_BALANCE_CACHE: dict[str, dict] = {}
+KIS_TOKEN_CACHE: dict[str, dict] = {}
 
 AUTH_PROVIDERS = [
     {"value": "google", "label": "Google", "subtitle": "Google 계정으로 시작", "className": "auth-google", "email": "gmail.com", "icon": "G"},
@@ -88,12 +115,17 @@ AI_PROVIDERS = [
 FLASH_MESSAGES = {
     "logged_in": {"kind": "success", "text": "로그인 세션을 시작했습니다."},
     "logged_out": {"kind": "success", "text": "로그아웃했습니다."},
+    "sso_started": {"kind": "success", "text": "SSO 인증 페이지로 이동합니다."},
+    "sso_not_configured": {"kind": "warning", "text": "선택한 SSO 제공사의 키 설정이 아직 없습니다."},
+    "sso_failed": {"kind": "warning", "text": "SSO 인증에 실패했습니다. 다시 시도해 주세요."},
     "signed_up": {"kind": "success", "text": "회원가입이 완료되어 대시보드로 이동했습니다."},
     "find_id_requested": {"kind": "success", "text": "입력한 연락처 기준으로 아이디 안내 절차를 시작했습니다."},
     "find_password_requested": {"kind": "success", "text": "비밀번호 재설정 절차를 시작했습니다."},
     "reset": {"kind": "success", "text": "워크스페이스를 초기화했습니다."},
     "broker_added": {"kind": "success", "text": "증권 계좌를 추가했습니다."},
     "broker_removed": {"kind": "success", "text": "증권 연결을 삭제했습니다."},
+    "broker_live_connected": {"kind": "success", "text": "브로커 API 연결 테스트를 통과했습니다."},
+    "broker_live_warning": {"kind": "warning", "text": "브로커 연결은 저장했지만 실 API 호출은 실패했습니다. 키와 계좌를 다시 확인해 주세요."},
     "symbol_added": {"kind": "success", "text": "감시 종목을 추가했습니다."},
     "symbol_removed": {"kind": "success", "text": "종목과 연결된 규칙을 삭제했습니다."},
     "pattern_added": {"kind": "success", "text": "자동매매 패턴을 저장했습니다."},
@@ -139,11 +171,12 @@ SYMBOL_LIBRARY = {
 
 def fresh_draft() -> dict:
     return {
-        "profile": {"nickname": "", "email": "", "phone": "", "auth_provider": "", "logged_in_at": ""},
+        "profile": {"nickname": "", "email": "", "phone": "", "auth_provider": "", "logged_in_at": "", "session_key": uuid4().hex},
         "brokers": [],
         "symbols": [],
         "patterns": [],
         "ai": {"provider": "", "model": "", "prompt": "", "has_api_key": False, "updated_at": ""},
+        "oauth": {"last_state": "", "provider": "", "started_at": ""},
     }
 
 
@@ -199,6 +232,9 @@ def load_draft(cookie_header: str | None) -> dict:
     merged["symbols"] = list(stored.get("symbols", []))[:20]
     merged["patterns"] = list(stored.get("patterns", []))[:20]
     merged["ai"].update(stored.get("ai", {}))
+    merged["oauth"].update(stored.get("oauth", {}))
+    if not merged["profile"].get("session_key"):
+        merged["profile"]["session_key"] = uuid4().hex
     return merged
 
 
@@ -256,6 +292,392 @@ def email_from_identity(user_id: str) -> str:
     return f"{identity}@autostock.kr"
 
 
+def user_runtime_key(draft: dict) -> str:
+    profile = draft.get("profile", {})
+    return trim(profile.get("email"), 160) or trim(profile.get("session_key"), 64) or "anonymous"
+
+
+def broker_store_for_user(draft: dict) -> dict[str, dict]:
+    key = user_runtime_key(draft)
+    if key not in BROKER_SECRET_STORE:
+        BROKER_SECRET_STORE[key] = {}
+    return BROKER_SECRET_STORE[key]
+
+
+def store_broker_credentials(draft: dict, broker_entry_id: str, broker_id: str, payload: dict[str, str]) -> None:
+    broker_store_for_user(draft)[broker_entry_id] = {"broker_id": broker_id, **payload}
+
+
+def get_broker_credentials(draft: dict, broker_entry_id: str) -> dict | None:
+    return broker_store_for_user(draft).get(broker_entry_id)
+
+
+def remove_broker_credentials(draft: dict, broker_entry_id: str) -> None:
+    broker_store_for_user(draft).pop(broker_entry_id, None)
+    BROKER_BALANCE_CACHE.pop(f"{user_runtime_key(draft)}:{broker_entry_id}", None)
+
+
+def clear_runtime_state(draft: dict) -> None:
+    key = user_runtime_key(draft)
+    BROKER_SECRET_STORE.pop(key, None)
+    for cache_key in list(BROKER_BALANCE_CACHE.keys()):
+        if cache_key.startswith(f"{key}:"):
+            BROKER_BALANCE_CACHE.pop(cache_key, None)
+
+
+def parse_int(value: object) -> int:
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+def format_amount(value: object) -> str:
+    return f"{parse_int(value):,}"
+
+
+def first_non_empty(row: dict, keys: list[str]) -> str:
+    for key in keys:
+        text = str(row.get(key, "")).strip()
+        if text:
+            return text
+    return ""
+
+
+def http_json_request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    json_body: dict | None = None,
+    form_body: dict[str, str] | None = None,
+) -> dict:
+    request_headers = dict(headers or {})
+    body: bytes | None = None
+    if json_body is not None:
+        request_headers["Content-Type"] = "application/json; charset=utf-8"
+        body = json.dumps(json_body).encode("utf-8")
+    elif form_body is not None:
+        request_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+        body = urlencode(form_body).encode("utf-8")
+
+    request = Request(url, data=body, headers=request_headers, method=method)
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except HTTPError as error:
+        payload = error.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"HTTP {error.code}: {payload[:240] or error.reason}") from error
+    except URLError as error:
+        raise RuntimeError(f"Network error: {error.reason}") from error
+
+
+def oauth_provider_settings(provider: str, base_url: str) -> dict:
+    upper = provider.upper()
+    client_id = os.environ.get(f"SSO_{upper}_CLIENT_ID", "").strip()
+    client_secret = os.environ.get(f"SSO_{upper}_CLIENT_SECRET", "").strip()
+    redirect_uri = os.environ.get(f"SSO_{upper}_REDIRECT_URI", "").strip() or f"{base_url}/auth/sso/callback/{provider}"
+    return {"client_id": client_id, "client_secret": client_secret, "redirect_uri": redirect_uri}
+
+
+def oauth_provider_authorize_url(provider: str) -> str:
+    return {
+        "google": "https://accounts.google.com/o/oauth2/v2/auth",
+        "kakao": "https://kauth.kakao.com/oauth/authorize",
+        "naver": "https://nid.naver.com/oauth2.0/authorize",
+        "facebook": "https://www.facebook.com/v20.0/dialog/oauth",
+    }[provider]
+
+
+def oauth_provider_token_url(provider: str) -> str:
+    return {
+        "google": "https://oauth2.googleapis.com/token",
+        "kakao": "https://kauth.kakao.com/oauth/token",
+        "naver": "https://nid.naver.com/oauth2.0/token",
+        "facebook": "https://graph.facebook.com/v20.0/oauth/access_token",
+    }[provider]
+
+
+def oauth_is_configured(provider: str, base_url: str) -> bool:
+    settings = oauth_provider_settings(provider, base_url)
+    return bool(settings["client_id"] and settings["client_secret"])
+
+
+def oauth_authorize_location(provider: str, base_url: str, state: str) -> str:
+    settings = oauth_provider_settings(provider, base_url)
+    params: dict[str, str] = {
+        "response_type": "code",
+        "client_id": settings["client_id"],
+        "redirect_uri": settings["redirect_uri"],
+        "state": state,
+    }
+    if provider == "google":
+        params["scope"] = "openid email profile"
+        params["prompt"] = "select_account"
+    elif provider == "kakao":
+        params["scope"] = "profile_nickname account_email"
+    elif provider == "facebook":
+        params["scope"] = "email,public_profile"
+    return f"{oauth_provider_authorize_url(provider)}?{urlencode(params)}"
+
+
+def oauth_exchange_code(provider: str, base_url: str, code: str, state: str) -> str:
+    settings = oauth_provider_settings(provider, base_url)
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": settings["client_id"],
+        "client_secret": settings["client_secret"],
+        "redirect_uri": settings["redirect_uri"],
+        "code": code,
+    }
+    if provider == "naver":
+        payload["state"] = state
+    token_data = http_json_request(oauth_provider_token_url(provider), method="POST", form_body=payload)
+    access_token = str(token_data.get("access_token", "")).strip()
+    if not access_token:
+        raise RuntimeError("access_token missing")
+    return access_token
+
+
+def oauth_user_profile(provider: str, access_token: str) -> dict[str, str]:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if provider == "google":
+        payload = http_json_request("https://openidconnect.googleapis.com/v1/userinfo", headers=headers)
+        return {"name": trim(payload.get("name"), 80), "email": trim(payload.get("email"), 120)}
+    if provider == "kakao":
+        payload = http_json_request("https://kapi.kakao.com/v2/user/me", headers=headers)
+        account = payload.get("kakao_account", {})
+        properties = payload.get("properties", {})
+        return {
+            "name": trim(account.get("profile", {}).get("nickname") or properties.get("nickname"), 80),
+            "email": trim(account.get("email"), 120),
+        }
+    if provider == "naver":
+        payload = http_json_request("https://openapi.naver.com/v1/nid/me", headers=headers)
+        response = payload.get("response", {})
+        return {
+            "name": trim(response.get("name") or response.get("nickname"), 80),
+            "email": trim(response.get("email"), 120),
+        }
+    if provider == "facebook":
+        payload = http_json_request(f"https://graph.facebook.com/me?{urlencode({'fields': 'id,name,email', 'access_token': access_token})}")
+        return {"name": trim(payload.get("name"), 80), "email": trim(payload.get("email"), 120)}
+    raise RuntimeError("unsupported provider")
+
+
+def kis_base_url(environment: str) -> str:
+    if environment == "mock":
+        return "https://openapivts.koreainvestment.com:29443"
+    return "https://openapi.koreainvestment.com:9443"
+
+
+def kis_tr_id(environment: str, prod_id: str, mock_id: str) -> str:
+    return mock_id if environment == "mock" else prod_id
+
+
+def kis_access_token(credentials: dict) -> str:
+    env = credentials["environment"]
+    app_key = credentials["app_key"]
+    cache_key = f"{env}:{app_key}"
+    cached = KIS_TOKEN_CACHE.get(cache_key)
+    now = time.time()
+    if cached and cached.get("expires_at", 0) > now + 30:
+        return cached["token"]
+
+    base_url = kis_base_url(env)
+    payload = {
+        "grant_type": "client_credentials",
+        "appkey": app_key,
+        "appsecret": credentials["app_secret"],
+    }
+    token_data = http_json_request(f"{base_url}/oauth2/tokenP", method="POST", json_body=payload)
+    access_token = str(token_data.get("access_token", "")).strip()
+    if not access_token:
+        message = trim(token_data.get("msg1"), 240) or "KIS access token 발급 실패"
+        raise RuntimeError(message)
+    expires_in = parse_int(token_data.get("expires_in"))
+    if expires_in <= 0:
+        expires_in = 60 * 60 * 12
+    KIS_TOKEN_CACHE[cache_key] = {"token": access_token, "expires_at": now + expires_in}
+    return access_token
+
+
+def kis_api_get(credentials: dict, path: str, params: dict[str, str], tr_id: str) -> dict:
+    token = kis_access_token(credentials)
+    base_url = kis_base_url(credentials["environment"])
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "appkey": credentials["app_key"],
+        "appsecret": credentials["app_secret"],
+        "tr_id": tr_id,
+        "custtype": "P",
+    }
+    url = f"{base_url}{path}?{urlencode(params)}"
+    return http_json_request(url, headers=headers)
+
+
+def kis_parse_credentials(raw: dict | None) -> dict | None:
+    if not raw:
+        return None
+    if raw.get("broker_id") != "kis":
+        return None
+    environment = trim(raw.get("environment"), 16) or "production"
+    app_key = trim(raw.get("appKey"), 180)
+    app_secret = trim(raw.get("appSecret"), 180)
+    cano = trim(raw.get("accountPrefix"), 16)
+    acnt_prdt_cd = trim(raw.get("accountProductCode"), 8)
+    if not cano:
+        account_number = trim(raw.get("accountNumber"), 20)
+        cano = account_number[:8]
+        acnt_prdt_cd = acnt_prdt_cd or account_number[8:10]
+    if not acnt_prdt_cd:
+        acnt_prdt_cd = "01"
+    if not (app_key and app_secret and cano and acnt_prdt_cd):
+        return None
+    return {
+        "environment": environment if environment in {"production", "mock"} else "production",
+        "app_key": app_key,
+        "app_secret": app_secret,
+        "cano": cano,
+        "acnt_prdt_cd": acnt_prdt_cd,
+    }
+
+
+def kis_fetch_balance_snapshot(credentials: dict) -> dict:
+    params = {
+        "CANO": credentials["cano"],
+        "ACNT_PRDT_CD": credentials["acnt_prdt_cd"],
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "01",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    response = kis_api_get(
+        credentials,
+        "/uapi/domestic-stock/v1/trading/inquire-balance",
+        params,
+        kis_tr_id(credentials["environment"], "TTTC8434R", "VTTC8434R"),
+    )
+    if str(response.get("rt_cd")) != "0":
+        raise RuntimeError(trim(response.get("msg1"), 240) or "KIS 잔고 조회 실패")
+
+    holdings = []
+    for row in response.get("output1", []) or []:
+        symbol = trim(row.get("pdno"), 16)
+        if not symbol:
+            continue
+        quantity = parse_int(row.get("hldg_qty"))
+        name = trim(row.get("prdt_name"), 80) or symbol
+        price = format_amount(first_non_empty(row, ["prpr", "stck_prpr", "pchs_avg_pric", "avrg_unpr"]))
+        change = trim(row.get("evlu_pfls_rt"), 24)
+        change_label = f"{change}%" if change else "-"
+        holdings.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "market": "KRX",
+                "price": price,
+                "change": change_label,
+                "quantity": quantity,
+            }
+        )
+
+    output2 = (response.get("output2") or [{}])[0]
+    total_eval = first_non_empty(output2, ["tot_evlu_amt", "scts_evlu_amt", "tot_evlu_pfls_amt"])
+    cash = first_non_empty(output2, ["dnca_tot_amt", "tot_dncl_amt", "ord_psbl_cash"])
+    profit = first_non_empty(output2, ["evlu_pfls_smtl_amt", "tot_evlu_pfls_amt"])
+    return {
+        "total_eval_amount": format_amount(total_eval),
+        "cash_amount": format_amount(cash),
+        "profit_amount": format_amount(profit),
+        "holdings_count": len(holdings),
+        "holdings": holdings,
+    }
+
+
+def kis_fetch_quote(credentials: dict, symbol_code: str) -> dict:
+    response = kis_api_get(
+        credentials,
+        "/uapi/domestic-stock/v1/quotations/inquire-price",
+        {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": symbol_code},
+        "FHKST01010100",
+    )
+    if str(response.get("rt_cd")) != "0":
+        raise RuntimeError(trim(response.get("msg1"), 240) or "KIS 종목 조회 실패")
+    output = response.get("output", {}) or {}
+    name = trim(output.get("hts_kor_isnm"), 80) or symbol_code
+    price = format_amount(first_non_empty(output, ["stck_prpr", "prpr"]))
+    change_rate = trim(output.get("prdy_ctrt"), 24)
+    change = f"{change_rate}%" if change_rate else "-"
+    return {"symbol": symbol_code, "name": name, "market": "KRX", "price": price, "change": change, "quantity": 0}
+
+
+def broker_balance_snapshot(draft: dict, broker_entry: dict) -> dict:
+    cache_key = f"{user_runtime_key(draft)}:{broker_entry['id']}"
+    cached = BROKER_BALANCE_CACHE.get(cache_key)
+    now = time.time()
+    if cached and cached.get("expires_at", 0) > now:
+        return cached
+
+    credentials = kis_parse_credentials(get_broker_credentials(draft, broker_entry["id"]))
+    if broker_entry["broker_id"] != "kis" or not credentials:
+        payload = {"status": "unsupported", "expires_at": now + 12}
+        BROKER_BALANCE_CACHE[cache_key] = payload
+        return payload
+
+    try:
+        snapshot = kis_fetch_balance_snapshot(credentials)
+        payload = {"status": "ok", "snapshot": snapshot, "expires_at": now + 15}
+    except Exception as error:
+        payload = {"status": "error", "message": trim(str(error), 200), "expires_at": now + 8}
+    BROKER_BALANCE_CACHE[cache_key] = payload
+    return payload
+
+
+def broker_symbol_catalog(draft: dict, broker_id: str, symbol_query: str | None = None) -> dict:
+    if broker_id != "kis":
+        return {"mode": "demo_catalog", "items": get_symbol_catalog(broker_id), "message": ""}
+
+    broker_entry = find_connected_broker(draft, broker_id)
+    if not broker_entry:
+        return {"mode": "demo_catalog", "items": get_symbol_catalog(broker_id), "message": ""}
+
+    credentials = kis_parse_credentials(get_broker_credentials(draft, broker_entry["id"]))
+    if not credentials:
+        return {"mode": "demo_catalog", "items": get_symbol_catalog(broker_id), "message": "KIS 실연동 키가 없어 데모 목록으로 표시합니다."}
+
+    try:
+        snapshot = kis_fetch_balance_snapshot(credentials)
+        items = list(snapshot["holdings"])
+        query = trim(symbol_query, 24).upper()
+        if query and all(item["symbol"] != query for item in items):
+            items.insert(0, kis_fetch_quote(credentials, query))
+        return {"mode": "live_broker_api", "items": items[:80], "message": ""}
+    except Exception as error:
+        return {
+            "mode": "live_broker_api_error",
+            "items": get_symbol_catalog(broker_id),
+            "message": f"실제 KIS 종목/잔고 조회 실패: {trim(str(error), 180)}",
+        }
+
+
+def symbol_choice_from_broker(draft: dict, broker_id: str, symbol_code: str) -> dict | None:
+    catalog = broker_symbol_catalog(draft, broker_id, symbol_code)
+    for item in catalog.get("items", []):
+        if item.get("symbol") == symbol_code:
+            return item
+    return None
+
+
 def flash_message_from_query(query: dict[str, list[str]]) -> dict | None:
     flash_key = query.get("flash", [""])[-1]
     return FLASH_MESSAGES.get(flash_key)
@@ -306,14 +728,17 @@ def get_symbol_catalog(broker_id: str | None) -> list[dict]:
     return SYMBOL_LIBRARY.get(broker_id, SYMBOL_LIBRARY["default"])
 
 
-def lookup_symbol_choice(broker_id: str, symbol_code: str) -> dict | None:
-    for item in get_symbol_catalog(broker_id):
-        if item["symbol"] == symbol_code:
-            return item
-    return None
+def collect_broker_secret_payload(broker: dict, values: dict[str, str]) -> dict[str, str]:
+    payload: dict[str, str] = {}
+    for field in broker.get("fields", []):
+        key = field.get("key")
+        if key:
+            payload[key] = trim(values.get(key), 240)
+    payload["environment"] = trim(values.get("environment"), 20) or "production"
+    return payload
 
 
-def upsert_broker_entry(draft: dict, broker: dict, values: dict[str, str]) -> None:
+def upsert_broker_entry(draft: dict, broker: dict, values: dict[str, str]) -> dict:
     account_label = trim(values.get("accountNumber"), 40)
     if not account_label:
         account_prefix = trim(values.get("accountPrefix"), 40)
@@ -323,8 +748,18 @@ def upsert_broker_entry(draft: dict, broker: dict, values: dict[str, str]) -> No
     if not account_label:
         account_label = trim(values.get("htsId"), 40) or "연결 정보"
 
+    existing_match = next(
+        (
+            item
+            for item in draft["brokers"]
+            if item["broker_id"] == broker["id"]
+            and item["environment"] == values.get("environment", "production")
+            and item["account_label"] == account_label
+        ),
+        None,
+    )
     entry = {
-        "id": uuid4().hex[:10],
+        "id": existing_match["id"] if existing_match else uuid4().hex[:10],
         "broker_id": broker["id"],
         "broker_name": broker["name"],
         "environment": values.get("environment", "production"),
@@ -342,6 +777,7 @@ def upsert_broker_entry(draft: dict, broker: dict, values: dict[str, str]) -> No
         )
     ]
     draft["brokers"] = [entry, *existing][:8]
+    return entry
 
 
 def add_symbol_entry(draft: dict, form: dict[str, str]) -> tuple[bool, str]:
@@ -353,7 +789,7 @@ def add_symbol_entry(draft: dict, form: dict[str, str]) -> tuple[bool, str]:
     if not symbol_code:
         return False, "종목을 먼저 선택해야 합니다."
 
-    symbol_meta = lookup_symbol_choice(broker_id, symbol_code)
+    symbol_meta = symbol_choice_from_broker(draft, broker_id, symbol_code)
     if not symbol_meta:
         return False, "선택한 종목을 찾지 못했습니다."
 
@@ -517,12 +953,9 @@ def render_social_icons() -> str:
     for provider in AUTH_PROVIDERS:
         buttons.append(
             f"""
-            <form method="post" action="/auth/demo">
-              <input type="hidden" name="provider" value="{html(provider['value'])}" />
-              <button class="sso-icon-button {html(provider['className'])}" type="submit" aria-label="{html(provider['label'])}">
-                <span>{html(provider['icon'])}</span>
-              </button>
-            </form>
+            <a class="sso-icon-button {html(provider['className'])}" href="/auth/sso/start?provider={html(provider['value'])}" aria-label="{html(provider['label'])}">
+              <span>{html(provider['icon'])}</span>
+            </a>
             """
         )
     return "".join(buttons)
@@ -635,7 +1068,7 @@ def render_auth_page(mode: str, message: dict | None = None, values: dict[str, s
         <div class="sso-row">
           {social_icons}
         </div>
-        <p class="auth-helper">SSO는 현재 데모 세션으로 연결됩니다.</p>
+        <p class="auth-helper">설정된 OAuth 키로 실제 SSO 인증을 진행합니다.</p>
         """.replace("{social_icons}", render_social_icons())
 
     html_body = f"""<!doctype html>
@@ -743,6 +1176,19 @@ def render_connected_brokers(draft: dict) -> str:
     cards = []
     for item in draft["brokers"]:
         env_label = "실전" if item["environment"] == "production" else "모의"
+        balance = broker_balance_snapshot(draft, item)
+        balance_note = ""
+        if balance.get("status") == "ok":
+            snapshot = balance.get("snapshot", {})
+            balance_note = (
+                f"평가자산 {html(snapshot.get('total_eval_amount', '-'))}원 · "
+                f"현금 {html(snapshot.get('cash_amount', '-'))}원 · "
+                f"보유종목 {html(snapshot.get('holdings_count', 0))}개"
+            )
+        elif balance.get("status") == "error":
+            balance_note = f"잔고 조회 실패: {html(balance.get('message', 'unknown error'))}"
+        elif item["broker_id"] == "kis":
+            balance_note = "KIS API 키/계좌 정보가 없어서 잔고를 조회하지 못했습니다."
         cards.append(
             f"""
             <div class="broker-card">
@@ -750,6 +1196,7 @@ def render_connected_brokers(draft: dict) -> str:
                 <strong>{html(item["broker_name"])}</strong>
                 <span>{html(item["account_label"])}</span>
                 <small>{html(item.get("capability_summary", ""))}</small>
+                <small>{balance_note}</small>
               </div>
               <div class="broker-card-actions">
                 <span class="status-chip">{html(env_label)}</span>
@@ -877,7 +1324,7 @@ def render_guide_panel() -> str:
       </div>
       <div class="guide-card">
         <strong>실브로커 연동</strong>
-        <p>현재 종목 선택은 브로커별 데모 카탈로그 기반입니다. 실제 주문 API 연결은 다음 단계에서 붙입니다.</p>
+        <p>연결된 증권 계좌 기준으로 종목·잔고를 조회하고, 지원하지 않는 브로커는 안내 문구를 노출합니다.</p>
       </div>
     </div>
     """
@@ -1014,7 +1461,7 @@ def render_broker_modal(draft: dict, selected_broker_id: str, values: dict[str, 
             <div class="button-row">
               <button class="button button-primary" type="submit">이 증권 연결</button>
             </div>
-            <small>실제 API 키 원문은 저장하지 않고 연결 메타 정보만 임시로 보관합니다.</small>
+            <small>브로커 키는 서버 메모리에만 보관되며 프로세스 재시작 시 초기화됩니다.</small>
           </div>
         </form>
       </div>
@@ -1029,7 +1476,13 @@ def render_broker_modal(draft: dict, selected_broker_id: str, values: dict[str, 
     return render_modal_shell("증권 추가", "빈 대시보드에서 가장 먼저 계좌를 연결합니다.", body, message)
 
 
-def render_symbol_modal(draft: dict, selected_broker_id: str | None, values: dict[str, str], message: dict | None) -> str:
+def render_symbol_modal(
+    draft: dict,
+    selected_broker_id: str | None,
+    values: dict[str, str],
+    query: dict[str, list[str]],
+    message: dict | None,
+) -> str:
     if not draft["brokers"]:
         body = """
         <div class="section-empty">
@@ -1041,6 +1494,7 @@ def render_symbol_modal(draft: dict, selected_broker_id: str | None, values: dic
         return render_modal_shell("종목 추가", "브로커 연결 후 종목 선택이 열립니다.", body, message)
 
     broker_id = selected_broker_id or values.get("brokerId") or draft["brokers"][0]["broker_id"]
+    symbol_query = trim(query.get("q", [""])[-1], 24).upper()
     broker_tabs = []
     for broker in draft["brokers"]:
         classes = "broker-tab is-active" if broker["broker_id"] == broker_id else "broker-tab"
@@ -1048,9 +1502,12 @@ def render_symbol_modal(draft: dict, selected_broker_id: str | None, values: dic
             f'<a class="{classes}" href="/dashboard?modal=symbol&broker={html(broker["broker_id"])}"><strong>{html(broker["broker_name"])}</strong><span>{html(broker["account_label"])}</span></a>'
         )
 
-    catalog = get_symbol_catalog(broker_id)
+    catalog_payload = broker_symbol_catalog(draft, broker_id, symbol_query)
+    catalog = catalog_payload.get("items", [])
     option_label = lambda item: f'{item["name"]} ({item["symbol"]}) · {item["market"]} · {item["price"]} · {item["change"]}'
     symbol_options = [{"value": item["symbol"], "label": option_label(item)} for item in catalog]
+    if not symbol_options:
+        symbol_options = [{"value": "", "label": "조회된 종목이 없습니다. 종목코드 조회를 먼저 실행하세요."}]
     preview_cards = "".join(
         f"""
         <div class="quote-card">
@@ -1062,13 +1519,22 @@ def render_symbol_modal(draft: dict, selected_broker_id: str | None, values: dic
         """
         for item in catalog[:4]
     )
+    mode_text = "실브로커 조회" if catalog_payload.get("mode") == "live_broker_api" else "대체 목록"
+    api_message = catalog_payload.get("message", "")
     body = f"""
     <div class="broker-picker">{''.join(broker_tabs)}</div>
     <div class="modal-split">
       <div class="modal-panel">
+        <form method="get" action="/dashboard" class="inline-form">
+          <input type="hidden" name="modal" value="symbol" />
+          <input type="hidden" name="broker" value="{html(broker_id)}" />
+          <input class="inline-input" name="q" value="{html(symbol_query)}" placeholder="종목코드(예: 005930) 조회" />
+          <button class="button button-secondary button-small" type="submit">코드 조회</button>
+        </form>
+        {f'<div class="message message-warning">{html(api_message)}</div>' if api_message else ''}
         <form method="post" action="/dashboard/symbols/add" class="form-grid">
           <input type="hidden" name="brokerId" value="{html(broker_id)}" />
-          {render_select("symbolCode", "종목 선택", symbol_options, values.get("symbolCode"), "연결한 증권 기준 종목 카탈로그에서 선택", required=True)}
+          {render_select("symbolCode", "종목 선택", symbol_options, values.get("symbolCode"), "연결한 증권 계좌에서 조회한 종목 또는 코드 조회 결과", required=True)}
           <div class="field field-full">
             <div class="button-row">
               <button class="button button-primary" type="submit">워치리스트에 추가</button>
@@ -1078,7 +1544,7 @@ def render_symbol_modal(draft: dict, selected_broker_id: str | None, values: dic
       </div>
       <div class="modal-panel">
         <h4>브로커 기반 종목 목록</h4>
-        <p class="panel-copy">실제 브로커 검색 API 연결 전까지는 데모 카탈로그로 흐름을 검증합니다.</p>
+        <p class="panel-copy">조회 모드: {html(mode_text)} · 종목 수: {html(len(catalog))}개</p>
         <div class="quote-grid">{preview_cards}</div>
       </div>
     </div>
@@ -1196,7 +1662,7 @@ def render_modal(draft: dict, modal: str | None, query: dict[str, list[str]], va
     if modal == "broker":
         return render_broker_modal(draft, selected_broker_id, values or {}, message, validation)
     if modal == "symbol":
-        return render_symbol_modal(draft, selected_broker_id, values or {}, message)
+        return render_symbol_modal(draft, selected_broker_id, values or {}, query, message)
     if modal == "pattern":
         return render_pattern_modal(draft, values or {}, message)
     if modal == "ai":
@@ -1358,6 +1824,13 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(raw, keep_blank_values=True)
         return {key: values[-1] if values else "" for key, values in parsed.items()}
 
+    def _base_url(self) -> str:
+        if APP_BASE_URL:
+            return APP_BASE_URL.rstrip("/")
+        host = self.headers.get("Host", "127.0.0.1")
+        proto = self.headers.get("X-Forwarded-Proto", "http")
+        return f"{proto}://{host}"
+
     def _route_get(self, *, include_body: bool) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -1373,6 +1846,70 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.SEE_OTHER)
                 self.send_header("Location", location)
                 self.end_headers()
+            return
+
+        if path == "/auth/sso/start":
+            provider = trim(query.get("provider", [""])[-1], 24).lower()
+            if provider not in {item["value"] for item in AUTH_PROVIDERS}:
+                self._send_redirect("/login?flash=sso_failed")
+                return
+            base_url = self._base_url()
+            if not oauth_is_configured(provider, base_url):
+                self._send_redirect("/login?flash=sso_not_configured")
+                return
+            now = time.time()
+            for key, value in list(OAUTH_PENDING.items()):
+                if now - float(value.get("created_at", now)) > 900:
+                    OAUTH_PENDING.pop(key, None)
+            state = secrets.token_urlsafe(24)
+            OAUTH_PENDING[state] = {"provider": provider, "created_at": now, "session_key": draft["profile"].get("session_key", "")}
+            draft["oauth"] = {"last_state": state, "provider": provider, "started_at": now_iso()}
+            self._send_redirect(
+                oauth_authorize_location(provider, base_url, state),
+                extra_headers={"Set-Cookie": draft_cookie_header(draft)},
+            )
+            return
+
+        if path.startswith("/auth/sso/callback/"):
+            provider = trim(path.rsplit("/", 1)[-1], 24).lower()
+            state = trim(query.get("state", [""])[-1], 180)
+            code = trim(query.get("code", [""])[-1], 240)
+            if provider not in {item["value"] for item in AUTH_PROVIDERS}:
+                self._send_redirect("/login?flash=sso_failed")
+                return
+            pending = OAUTH_PENDING.pop(state, None)
+            if not pending or pending.get("provider") != provider:
+                self._send_redirect("/login?flash=sso_failed")
+                return
+            if trim(query.get("error", [""])[-1], 64):
+                self._send_redirect("/login?flash=sso_failed")
+                return
+            if not code:
+                self._send_redirect("/login?flash=sso_failed")
+                return
+
+            try:
+                token = oauth_exchange_code(provider, self._base_url(), code, state)
+                profile = oauth_user_profile(provider, token)
+                email = trim(profile.get("email"), 120)
+                if not email:
+                    raise RuntimeError("email missing from provider profile")
+                nickname = trim(profile.get("name"), 80) or provider_meta(provider)["label"] + " 사용자"
+            except Exception:
+                self._send_redirect("/login?flash=sso_failed")
+                return
+
+            clear_runtime_state(draft)
+            draft = fresh_draft()
+            draft["profile"] = {
+                "nickname": nickname,
+                "email": email,
+                "phone": "",
+                "auth_provider": provider,
+                "logged_in_at": now_iso(),
+                "session_key": pending.get("session_key") or draft["profile"].get("session_key"),
+            }
+            self._send_redirect("/dashboard?flash=logged_in", extra_headers={"Set-Cookie": draft_cookie_header(draft)})
             return
 
         if path in {"/login", "/signup", "/find-id", "/find-password"}:
@@ -1431,12 +1968,15 @@ class AppHandler(BaseHTTPRequestHandler):
             if not broker:
                 self._send_json(HTTPStatus.NOT_FOUND, {"detail": "broker_not_found"}, include_body=include_body)
                 return
+            query_symbol = trim(query.get("q", [""])[-1], 24).upper()
+            catalog_payload = broker_symbol_catalog(draft, broker_id, query_symbol)
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "broker_id": broker_id,
-                    "mode": "demo_catalog",
-                    "items": get_symbol_catalog(broker_id),
+                    "mode": catalog_payload.get("mode"),
+                    "message": catalog_payload.get("message", ""),
+                    "items": catalog_payload.get("items", []),
                 },
                 include_body=include_body,
             )
@@ -1497,6 +2037,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            clear_runtime_state(draft)
             draft = fresh_draft()
             draft["profile"] = {
                 "nickname": nickname_from_identity(user_id),
@@ -1532,6 +2073,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            clear_runtime_state(draft)
             draft = fresh_draft()
             draft["profile"] = {
                 "nickname": nickname,
@@ -1578,6 +2120,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if provider not in {item["value"] for item in AUTH_PROVIDERS}:
                 self._send_redirect("/login")
                 return
+            clear_runtime_state(draft)
             meta = provider_meta(provider)
             draft = fresh_draft()
             draft["profile"] = {
@@ -1591,6 +2134,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/auth/logout":
+            clear_runtime_state(draft)
             self._send_redirect("/login?flash=logged_out", extra_headers={"Set-Cookie": clear_cookie_header()})
             return
 
@@ -1599,6 +2143,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/dashboard/reset":
+            clear_runtime_state(draft)
             self._send_redirect("/login?flash=reset", extra_headers={"Set-Cookie": clear_cookie_header()})
             return
 
@@ -1617,9 +2162,20 @@ class AppHandler(BaseHTTPRequestHandler):
 
             validation = validate_broker_values(broker, form)
             if validation["is_supported"] and not validation["missing_fields"]:
-                upsert_broker_entry(draft, broker, form)
+                entry = upsert_broker_entry(draft, broker, form)
+                store_broker_credentials(draft, entry["id"], broker["id"], collect_broker_secret_payload(broker, form))
+                flash_key = "broker_added"
+                if broker["id"] == "kis":
+                    credentials = kis_parse_credentials(get_broker_credentials(draft, entry["id"]))
+                    if credentials:
+                        try:
+                            kis_fetch_balance_snapshot(credentials)
+                            BROKER_BALANCE_CACHE.pop(f"{user_runtime_key(draft)}:{entry['id']}", None)
+                            flash_key = "broker_live_connected"
+                        except Exception:
+                            flash_key = "broker_live_warning"
                 self._send_redirect(
-                    f"/dashboard?flash=broker_added&modal=symbol&broker={html(selected_broker)}",
+                    f"/dashboard?flash={flash_key}&modal=symbol&broker={html(selected_broker)}",
                     extra_headers={"Set-Cookie": draft_cookie_header(draft)},
                 )
                 return
@@ -1635,7 +2191,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/dashboard/brokers/remove":
-            draft["brokers"] = remove_item(draft["brokers"], trim(form.get("itemId"), 40))
+            removed_id = trim(form.get("itemId"), 40)
+            remove_broker_credentials(draft, removed_id)
+            draft["brokers"] = remove_item(draft["brokers"], removed_id)
             remaining_ids = {item["broker_id"] for item in draft["brokers"]}
             draft["symbols"] = [item for item in draft["symbols"] if item["broker_id"] in remaining_ids]
             remaining_symbol_ids = {item["id"] for item in draft["symbols"]}

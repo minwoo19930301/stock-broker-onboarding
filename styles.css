@@ -211,10 +211,6 @@ textarea {
   gap: 12px;
 }
 
-.sso-row form {
-  margin: 0;
-}
-
 .sso-icon-button {
   display: inline-flex;
   align-items: center;
@@ -226,6 +222,7 @@ textarea {
   background: #fff;
   font-weight: 800;
   cursor: pointer;
+  text-decoration: none;
 }
 
 .sso-icon-button span {
@@ -438,6 +435,22 @@ textarea {
   margin: 6px 0 0;
   color: var(--text-soft);
   font-size: 0.92rem;
+}
+
+.inline-form {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.inline-input {
+  flex: 1 1 auto;
+  min-width: 180px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: #fff;
 }
 
 .stack-list,
@@ -865,6 +878,11 @@ textarea {
     grid-template-columns: 1fr;
     padding: 14px;
     background: #fff;
+  }
+
+  .inline-form {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .modal-backdrop {
