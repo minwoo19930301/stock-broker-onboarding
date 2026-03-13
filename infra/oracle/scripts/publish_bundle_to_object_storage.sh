@@ -14,6 +14,7 @@ BUNDLE_PATH="${STATE_DIR}/${BUNDLE_NAME}"
 PAR_NAME="stock-broker-deploy-${TIMESTAMP}"
 
 mkdir -p "${STATE_DIR}"
+export COPYFILE_DISABLE=1
 
 if [[ ! -x "${OCI_BIN}" ]]; then
   echo "OCI CLI not found at ${OCI_BIN}" >&2
@@ -24,6 +25,7 @@ tar \
   --exclude='.git' \
   --exclude='.tools' \
   --exclude='.deploy' \
+  --exclude='._*' \
   --exclude='backend/.venv' \
   --exclude='__pycache__' \
   -czf "${BUNDLE_PATH}" \

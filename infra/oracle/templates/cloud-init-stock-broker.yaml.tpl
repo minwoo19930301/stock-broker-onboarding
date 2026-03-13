@@ -10,11 +10,13 @@ write_files:
       APP_DIR="/opt/stock-broker-onboarding"
       TMP_BUNDLE="/tmp/stock-broker-onboarding.tar.gz"
 
-      if command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl tar
-      elif command -v apt-get >/dev/null 2>&1; then
-        apt-get update
-        apt-get install -y curl tar
+      if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        if command -v dnf >/dev/null 2>&1; then
+          dnf install -y curl tar
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update
+          apt-get install -y curl tar
+        fi
       fi
 
       mkdir -p /opt
