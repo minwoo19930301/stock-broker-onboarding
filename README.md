@@ -29,19 +29,10 @@
 - 실서비스에서는 입력값을 서버 측 암호화 저장소로 옮기고 감사로그를 남겨야 합니다.
 - 한국투자증권처럼 개인 self-use와 고객 대상 제휴 흐름이 분리된 증권사는 약관/제휴 요건을 별도로 검토해야 합니다.
 
-실행:
+라이브:
 
-1. Python 서버를 실행합니다.
-2. 브라우저에서 로컬 페이지 또는 배포 주소로 접속합니다.
-
-예시:
-
-```bash
-cd "/Users/minwokim/Documents/New project/stock-broker-onboarding"
-PORT=4321 python3 server.py
-```
-
-그 다음 브라우저에서 `http://localhost:4321` 로 접속합니다.
+- 로그인: https://158.179.166.26.sslip.io/login
+- 상태 확인: https://158.179.166.26.sslip.io/healthz
 
 환경변수(SSO):
 
